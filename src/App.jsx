@@ -1,4 +1,5 @@
 import { Dialog } from '@base-ui/react/dialog';
+import { Popover } from '@base-ui/react/popover';
 import { cloneElement, isValidElement, useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, apiUrl } from './api.js';
 
@@ -216,7 +217,7 @@ function Sidebar({ route, onNavigate, serviceState, version }) {
   return <aside className="sidebar">
     <div className="brand"><span className="brand-mark"><i className="bi bi-signpost-split-fill" aria-hidden="true" /></span><div><strong>反向代理管理器</strong><small>Reverse Proxy</small></div></div>
     <nav className="nav-list" aria-label="主导航">{Object.entries(ROUTES).map(([key, item]) => <button key={key} type="button" className={`nav-item${route === key ? ' active' : ''}`} aria-current={route === key ? 'page' : undefined} onClick={() => onNavigate(key)}><i className={`bi ${item.icon}`} aria-hidden="true" /><span>{item.label}</span></button>)}</nav>
-    <footer className="sidebar-footer"><div className={`sidebar-health ${serviceState}`}><span><i className={`status-dot ${serviceState === 'healthy' ? 'online' : serviceState === 'loading' ? 'warning' : 'offline'}`} aria-hidden="true" />{serviceLabel}</span><small>{serviceDetail} · v{version || '1.0.3'}</small></div></footer>
+    <footer className="sidebar-footer"><div className={`sidebar-health ${serviceState}`}><span><i className={`status-dot ${serviceState === 'healthy' ? 'online' : serviceState === 'loading' ? 'warning' : 'offline'}`} aria-hidden="true" />{serviceLabel}</span><small>{serviceDetail} · v{version || '1.0.4'}</small></div></footer>
   </aside>;
 }
 
@@ -240,33 +241,25 @@ function ProtocolBadges({ protocols }) {
 
 function RuleActionMenu({ rule, pending, testUnavailable, onToggle: onRuleToggle, onTest, onEdit, onDuplicate, onDelete }) {
   const [open, setOpen] = useState(false);
-  const detailsRef = useRef(null);
-  useEffect(() => {
-    if (!open) return undefined;
-    const closeOutside = (event) => {
-      if (!detailsRef.current?.contains(event.target)) setOpen(false);
-    };
-    const closeWithEscape = (event) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      setOpen(false);
-      window.requestAnimationFrame(() => detailsRef.current?.querySelector('summary')?.focus());
-    };
-    document.addEventListener('pointerdown', closeOutside, true);
-    document.addEventListener('keydown', closeWithEscape);
-    return () => {
-      document.removeEventListener('pointerdown', closeOutside, true);
-      document.removeEventListener('keydown', closeWithEscape);
-    };
-  }, [open]);
   const run = (action) => {
     setOpen(false);
     action();
   };
-  return <details ref={detailsRef} className="action-menu" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-    <summary aria-label={`打开 ${rule.name} 的操作菜单`} aria-expanded={open}><i className="bi bi-three-dots-vertical" aria-hidden="true" /></summary>
-    <div><span className="menu-toggle"><span>{rule.enabled ? '规则已启用' : '规则已停用'}</span><Toggle checked={rule.enabled} label={`${rule.enabled ? '停用' : '启用'} ${rule.name}`} disabled={pending} onChange={(enabled) => run(() => onRuleToggle(rule, enabled))} /></span><button type="button" disabled={pending || testUnavailable} aria-describedby={testUnavailable ? `test-help-${rule.id}` : undefined} onClick={() => run(() => onTest(rule))}><i className="bi bi-activity" aria-hidden="true" />测试目标</button>{testUnavailable ? <p className="menu-help" id={`test-help-${rule.id}`}>规则正常运行后才能测试目标。</p> : null}<button type="button" onClick={() => run(() => onEdit(rule))}><i className="bi bi-pencil" aria-hidden="true" />编辑规则</button><button type="button" disabled={pending} onClick={() => run(() => onDuplicate(rule))}><i className="bi bi-copy" aria-hidden="true" />创建副本</button><button type="button" className="danger" disabled={pending} onClick={() => run(() => onDelete(rule))}><i className="bi bi-trash3" aria-hidden="true" />删除规则</button></div>
-  </details>;
+  return <Popover.Root open={open} onOpenChange={setOpen}>
+    <Popover.Trigger className="action-menu-trigger" aria-label={`${open ? '关闭' : '打开'} ${rule.name} 的操作菜单`}><i className="bi bi-three-dots-vertical" aria-hidden="true" /></Popover.Trigger>
+    <Popover.Portal>
+      <Popover.Positioner className="action-menu-positioner" side="bottom" align="end" sideOffset={6} positionMethod="fixed" collisionPadding={{ top: 12, right: 12, bottom: 88, left: 12 }} collisionAvoidance={{ side: 'flip', align: 'shift', fallbackAxisSide: 'none' }}>
+        <Popover.Popup className="action-menu-popup" aria-label={`${rule.name} 的规则操作`}>
+          <span className="menu-toggle"><span>{rule.enabled ? '规则已启用' : '规则已停用'}</span><Toggle checked={rule.enabled} label={`${rule.enabled ? '停用' : '启用'} ${rule.name}`} disabled={pending} onChange={(enabled) => run(() => onRuleToggle(rule, enabled))} /></span>
+          <button type="button" className="action-menu-action" disabled={pending || testUnavailable} aria-describedby={testUnavailable ? `test-help-${rule.id}` : undefined} onClick={() => run(() => onTest(rule))}><i className="bi bi-activity" aria-hidden="true" />测试目标</button>
+          {testUnavailable ? <p className="menu-help" id={`test-help-${rule.id}`}>规则正常运行后才能测试目标。</p> : null}
+          <button type="button" className="action-menu-action" onClick={() => run(() => onEdit(rule))}><i className="bi bi-pencil" aria-hidden="true" />编辑规则</button>
+          <button type="button" className="action-menu-action" disabled={pending} onClick={() => run(() => onDuplicate(rule))}><i className="bi bi-copy" aria-hidden="true" />创建副本</button>
+          <button type="button" className="action-menu-action danger" disabled={pending} onClick={() => run(() => onDelete(rule))}><i className="bi bi-trash3" aria-hidden="true" />删除规则</button>
+        </Popover.Popup>
+      </Popover.Positioner>
+    </Popover.Portal>
+  </Popover.Root>;
 }
 
 function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDuplicate, onDelete, onTest, busy }) {
@@ -645,14 +638,14 @@ function SettingsPage({ settings, network, status, statusState, networkAvailable
   };
   const statusChipState = statusState === 'loading' ? 'starting' : statusState === 'healthy' ? 'healthy' : 'error';
   const availableAddresses = networkAvailable ? [...new Set((network.interfaces || []).map((item) => item.address).filter(Boolean))] : [];
-  return <section className="view" aria-label="设置"><div className="settings-grid"><article className="matte-surface settings-card"><div className="section-heading"><div><h2>运行检测</h2><p>定期检查全部目标端口，及时发现不可用的后端服务。</p></div>{dirty ? <span className="unsaved-badge">未保存</span> : null}</div><div className="form-stack">{submitError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{submitError}</div> : null}<Field label="健康检查间隔（秒）" hint="可设置 5–3600 秒" error={intervalError}><input type="number" min="5" max="3600" value={draft.healthCheckInterval ?? ''} onChange={(event) => update('healthCheckInterval', event.target.value)} /></Field><Field label="日志记录级别"><select value={draft.logLevel || 'info'} onChange={(event) => update('logLevel', event.target.value)}><option value="debug">DEBUG（详细）</option><option value="info">INFO（日常）</option><option value="warn">WARN（仅警告）</option><option value="error">ERROR（仅错误）</option></select></Field><button type="button" className="primary-button align-start" disabled={saving || importing || !dirty} onClick={() => void save()}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{saving ? '正在保存…' : '保存设置'}</button></div></article><article className="matte-surface settings-card"><div className="section-heading"><div><h2>配置备份</h2><p>导出规则与设置。为保护安全，备份不会包含证书私钥。</p></div></div><div className="backup-actions"><a className="primary-button" href={apiUrl('/export')} download><i className="bi bi-download" aria-hidden="true" />导出配置</a><label className="secondary-button file-button" aria-disabled={saving || importing}><i className={`bi ${importing ? 'bi-arrow-repeat' : 'bi-upload'}`} aria-hidden="true" />{importing ? '正在导入…' : '导入配置'}<input type="file" accept="application/json,.json" disabled={saving || importing} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importFile(file); event.target.value = ''; }} /></label><button type="button" className="secondary-button" onClick={onDiagnostics}><i className="bi bi-file-earmark-medical" aria-hidden="true" />诊断包</button></div><div className="backup-note"><i className="bi bi-info-circle" aria-hidden="true" /><span>合并导入时会重新生成规则标识，并保持规则停用，避免端口冲突。</span></div></article><article className="matte-surface settings-card system-card"><div className="section-heading"><div><h2>系统信息</h2></div><StatusChip state={statusChipState} label={statusChipState === 'starting' ? '检测中' : undefined} /></div><dl className="system-list"><div><dt>NAS 主机名</dt><dd>{networkAvailable ? network.hostname || '未知' : '暂无法读取'}</dd></div><div><dt>统一网关</dt><dd><code>/app/reverse-proxy</code></dd></div><div className="address-row"><dt>可用地址</dt><dd className="address-list">{!networkAvailable ? '暂无法读取' : availableAddresses.length ? availableAddresses.map((address) => <code key={address}>{address}</code>) : '未检测到'}</dd></div><div><dt>运行模式</dt><dd>{statusState === 'loading' ? '检测中' : statusState === 'error' ? '暂无法读取' : status?.demoMode ? '本地演示' : '真实代理'}</dd></div><div><dt>版本</dt><dd>{status?.version || '1.0.3'}</dd></div></dl></article></div></section>;
+  return <section className="view" aria-label="设置"><div className="settings-grid"><article className="matte-surface settings-card"><div className="section-heading"><div><h2>运行检测</h2><p>定期检查全部目标端口，及时发现不可用的后端服务。</p></div>{dirty ? <span className="unsaved-badge">未保存</span> : null}</div><div className="form-stack">{submitError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{submitError}</div> : null}<Field label="健康检查间隔（秒）" hint="可设置 5–3600 秒" error={intervalError}><input type="number" min="5" max="3600" value={draft.healthCheckInterval ?? ''} onChange={(event) => update('healthCheckInterval', event.target.value)} /></Field><Field label="日志记录级别"><select value={draft.logLevel || 'info'} onChange={(event) => update('logLevel', event.target.value)}><option value="debug">DEBUG（详细）</option><option value="info">INFO（日常）</option><option value="warn">WARN（仅警告）</option><option value="error">ERROR（仅错误）</option></select></Field><button type="button" className="primary-button align-start" disabled={saving || importing || !dirty} onClick={() => void save()}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{saving ? '正在保存…' : '保存设置'}</button></div></article><article className="matte-surface settings-card"><div className="section-heading"><div><h2>配置备份</h2><p>导出规则与设置。为保护安全，备份不会包含证书私钥。</p></div></div><div className="backup-actions"><a className="primary-button" href={apiUrl('/export')} download><i className="bi bi-download" aria-hidden="true" />导出配置</a><label className="secondary-button file-button" aria-disabled={saving || importing}><i className={`bi ${importing ? 'bi-arrow-repeat' : 'bi-upload'}`} aria-hidden="true" />{importing ? '正在导入…' : '导入配置'}<input type="file" accept="application/json,.json" disabled={saving || importing} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importFile(file); event.target.value = ''; }} /></label><button type="button" className="secondary-button" onClick={onDiagnostics}><i className="bi bi-file-earmark-medical" aria-hidden="true" />诊断包</button></div><div className="backup-note"><i className="bi bi-info-circle" aria-hidden="true" /><span>合并导入时会重新生成规则标识，并保持规则停用，避免端口冲突。</span></div></article><article className="matte-surface settings-card system-card"><div className="section-heading"><div><h2>系统信息</h2></div><StatusChip state={statusChipState} label={statusChipState === 'starting' ? '检测中' : undefined} /></div><dl className="system-list"><div><dt>NAS 主机名</dt><dd>{networkAvailable ? network.hostname || '未知' : '暂无法读取'}</dd></div><div><dt>统一网关</dt><dd><code>/app/reverse-proxy</code></dd></div><div className="address-row"><dt>可用地址</dt><dd className="address-list">{!networkAvailable ? '暂无法读取' : availableAddresses.length ? availableAddresses.map((address) => <code key={address}>{address}</code>) : '未检测到'}</dd></div><div><dt>运行模式</dt><dd>{statusState === 'loading' ? '检测中' : statusState === 'error' ? '暂无法读取' : status?.demoMode ? '本地演示' : '真实代理'}</dd></div><div><dt>版本</dt><dd>{status?.version || '1.0.4'}</dd></div></dl></article></div></section>;
 }
 
 function AboutPage({ version }) {
   return <section className="view" aria-label="关于"><article className="matte-surface about-card">
     <div className="about-brand"><img src="/app/reverse-proxy/images/reverse-proxy.png" alt="反向代理：请求经过网关转发到目标服务" /><div><h2>反向代理</h2><p>面向飞牛 fnOS 的多协议反向代理工具。</p></div></div>
     <dl className="about-list">
-      <div><dt>版本</dt><dd>{version || '1.0.3'}</dd></div>
+      <div><dt>版本</dt><dd>{version || '1.0.4'}</dd></div>
       <div><dt>项目地址</dt><dd><a href={PROJECT_URL} target="_blank" rel="noreferrer">{PROJECT_URL}<i className="bi bi-box-arrow-up-right" aria-hidden="true" /></a></dd></div>
       <div><dt>许可</dt><dd>Copyright © 2026 BearHero</dd></div>
     </dl>
@@ -769,7 +762,7 @@ export function App() {
     const [statusResult, rulesResult, certificatesResult] = results;
     const completedAt = Date.now();
     if (statusResult.status === 'fulfilled') setStatus(statusResult.value);
-    else setStatus((current) => ({ ...(current || {}), ok: false, version: current?.version || '1.0.3' }));
+    else setStatus((current) => ({ ...(current || {}), ok: false, version: current?.version || '1.0.4' }));
     if (rulesResult.status === 'fulfilled') { setRules(rulesResult.value.rules || []); setRuntime(rulesResult.value.runtime || {}); }
     if (certificatesResult.status === 'fulfilled') {
       setCertificates(certificatesResult.value.certificates || []);

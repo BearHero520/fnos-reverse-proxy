@@ -1,6 +1,6 @@
 {
   "name": "fnos-reverse-proxy",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "面向飞牛 fnOS 的易用型多协议反向代理原生应用",
   "private": true,
   "type": "module",

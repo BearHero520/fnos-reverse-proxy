@@ -12,7 +12,7 @@ const webBuild = path.join(root, 'build', 'web');
 const releaseDir = path.join(root, 'dist');
 const localFnpack = path.join(root, '.tools', 'fnpack', process.platform === 'win32' ? 'fnpack.exe' : 'fnpack');
 const fnpackCommand = process.env.FNPACK_PATH || (fs.existsSync(localFnpack) ? localFnpack : 'fnpack');
-const releaseVersion = '1.0.3';
+const releaseVersion = '1.0.4';
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }

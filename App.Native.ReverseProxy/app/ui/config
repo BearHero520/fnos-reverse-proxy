@@ -1,0 +1,17 @@
+{
+  ".url": {
+    "reverse-proxy.main": {
+      "title": "反向代理",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/reverse-proxy",
+      "gatewaySocket": "app.sock",
+      "url": "/app/reverse-proxy/",
+      "allUsers": false,
+      "control": {
+        "accessPerm": "readonly"
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "fnos-reverse-proxy-backend",
+  "version": "1.0.3",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "http-proxy": "^1.18.1",
+    "node-forge": "^1.4.0"
+  },
+  "overrides": {
+    "qs": "6.16.0"
+  }
+}

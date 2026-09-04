@@ -1,0 +1,116 @@
+#!/bin/bash
+
+LOG_FILE="${TRIM_PKGVAR}/service.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+SOCKET_PATH="${TRIM_APPDEST}/app.sock"
+APP_DIR="${TRIM_APPDEST}/server"
+DATA_DIR="${TRIM_PKGVAR}/data"
+FRONTEND_DIST="${TRIM_APPDEST}/www"
+GATEWAY_PREFIX="/app/reverse-proxy"
+
+export PATH="/var/apps/nodejs_v22/target/bin:${PATH}"
+mkdir -p "${DATA_DIR}"
+
+log_msg() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+check_process() {
+  local pid="$1"
+  case "${pid}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${pid}" -gt 1 ] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+
+  # A stale PID file must never make us report or kill an unrelated process.
+  # Both checks fail closed if /proc is unavailable or the process exits while
+  # it is being inspected.
+  local expected_cwd process_cwd
+  expected_cwd="$(readlink -f "${APP_DIR}" 2>/dev/null)" || return 1
+  process_cwd="$(readlink -f "/proc/${pid}/cwd" 2>/dev/null)" || return 1
+  [ "${process_cwd}" = "${expected_cwd}" ] || return 1
+
+  local -a process_args
+  mapfile -d '' -t process_args < "/proc/${pid}/cmdline" 2>/dev/null || return 1
+  [ "${#process_args[@]}" -ge 2 ] || return 1
+  case "${process_args[0]}" in
+    node|*/node) ;;
+    *) return 1 ;;
+  esac
+  [ "${process_args[1]}" = "server.js" ] || return 1
+  return 0
+}
+
+status_app() {
+  if [ -f "${PID_FILE}" ]; then
+    local pid
+    pid="$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')"
+    if check_process "${pid}"; then
+      return 0
+    fi
+    rm -f "${PID_FILE}"
+  fi
+  return 1
+}
+
+start_app() {
+  if status_app; then
+    return 0
+  fi
+  rm -f "${SOCKET_PATH}"
+  log_msg "Starting reverse proxy service"
+  cd "${APP_DIR}" || exit 1
+  NODE_ENV="production" DEMO_MODE="0" DATA_DIR="${DATA_DIR}" FRONTEND_DIST="${FRONTEND_DIST}" GATEWAY_PREFIX="${GATEWAY_PREFIX}" SOCKET_PATH="${SOCKET_PATH}" node server.js >> "${LOG_FILE}" 2>&1 &
+  local pid=$!
+  echo "${pid}" > "${PID_FILE}"
+  local count=0
+  while [ "${count}" -lt 10 ]; do
+    if ! check_process "${pid}"; then
+      log_msg "Reverse proxy service exited before becoming ready"
+      rm -f "${PID_FILE}" "${SOCKET_PATH}"
+      return 1
+    fi
+    if [ -S "${SOCKET_PATH}" ]; then
+      log_msg "Reverse proxy service is ready"
+      return 0
+    fi
+    sleep 1
+    count=$((count + 1))
+  done
+  log_msg "Reverse proxy service did not create its gateway socket in time"
+  if check_process "${pid}"; then
+    kill -TERM "${pid}" 2>> "${LOG_FILE}" || true
+  fi
+  rm -f "${PID_FILE}" "${SOCKET_PATH}"
+  return 1
+}
+
+stop_app() {
+  log_msg "Stopping reverse proxy service"
+  if [ ! -f "${PID_FILE}" ]; then
+    rm -f "${SOCKET_PATH}"
+    return 0
+  fi
+  local pid
+  pid="$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')"
+  if check_process "${pid}"; then
+    kill -TERM "${pid}" 2>> "${LOG_FILE}" || true
+    local count=0
+    while check_process "${pid}" && [ "${count}" -lt 10 ]; do
+      sleep 1
+      count=$((count + 1))
+    done
+    if check_process "${pid}"; then
+      kill -KILL "${pid}" 2>> "${LOG_FILE}" || true
+    fi
+  fi
+  rm -f "${PID_FILE}" "${SOCKET_PATH}"
+}
+
+case "$1" in
+  start) start_app ;;
+  stop) stop_app ;;
+  status) status_app && exit 0 || exit 3 ;;
+  *) echo "Unknown command: $1" > "${TRIM_TEMP_LOGFILE}"; exit 1 ;;
+esac

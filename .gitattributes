@@ -1,0 +1,6 @@
+* text=auto
+*.png binary
+App.Native.ReverseProxy/manifest text eol=lf
+App.Native.ReverseProxy/app/ui/config text eol=lf
+App.Native.ReverseProxy/cmd/* text eol=lf
+App.Native.ReverseProxy/config/* text eol=lf

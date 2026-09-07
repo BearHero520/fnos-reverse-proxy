@@ -1,4 +1,5 @@
 import dgram from 'node:dgram';
+import { randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import http from 'node:http';
 import https from 'node:https';
@@ -7,7 +8,7 @@ import fs from 'node:fs';
 import { Transform } from 'node:stream';
 import tls from 'node:tls';
 import httpProxy from 'http-proxy';
-import { listenPortsFor, sourceGroups, targetPortFor, targetPortsFor, targetProtocolFor } from './config-store.js';
+import { isRuleScheduleOpen, listenPortsFor, sourceGroups, targetPortFor, targetPortsFor, targetProtocolFor } from './config-store.js';
 
 const normalizeIp = (value = '') => String(value).replace(/^::ffff:/, '').split('%')[0];
 const urlHost = (host) => net.isIP(String(host).replace(/^\[|\]$/g, '')) === 6 ? `[${String(host).replace(/^\[|\]$/g, '')}]` : host;
@@ -138,6 +139,48 @@ function rejectUpgrade(socket, status, message, headers = {}) {
   socket.end(Buffer.concat([Buffer.from(lines.join('\r\n'), 'utf8'), body]));
 }
 
+function unmatchedSettings(store) {
+  return store.settings().unmatchedHost || { action: 'reject', statusCode: 404, redirectUrl: '', targetUrl: '' };
+}
+
+function handleUnmatchedHttp(store, proxy, request, response) {
+  const settings = unmatchedSettings(store);
+  if (settings.action === 'drop') {
+    request.socket.destroy();
+    return;
+  }
+  if (settings.action === 'redirect') {
+    const location = new URL(request.url || '/', settings.redirectUrl).toString();
+    response.writeHead(302, { Location: location, 'Cache-Control': 'no-store' });
+    response.end();
+    return;
+  }
+  if (settings.action === 'proxy') {
+    proxy.web(request, response, { target: settings.targetUrl, changeOrigin: true });
+    return;
+  }
+  response.writeHead(settings.statusCode || 404, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+  response.end('没有匹配此域名的代理规则');
+}
+
+function handleUnmatchedUpgrade(store, proxy, request, socket, head) {
+  const settings = unmatchedSettings(store);
+  if (settings.action === 'drop') {
+    socket.destroy();
+    return;
+  }
+  if (settings.action === 'redirect') {
+    const location = new URL(request.url || '/', settings.redirectUrl).toString();
+    rejectUpgrade(socket, '302 Found', '请求已重定向', { Location: location, 'Cache-Control': 'no-store' });
+    return;
+  }
+  if (settings.action === 'proxy') {
+    proxy.ws(request, socket, head, { target: settings.targetUrl, changeOrigin: true });
+    return;
+  }
+  rejectUpgrade(socket, `${settings.statusCode || 404} Not Found`, '没有匹配此域名的代理规则', { 'Cache-Control': 'no-store' });
+}
+
 function probeTcp(host, port, timeoutMs) {
   return new Promise((resolve) => {
     let socket;
@@ -213,7 +256,10 @@ async function probeEndpoints(endpoints, timeoutMs) {
   return { ok: true, message: endpoints.some((endpoint) => endpoint.transport === 'udp') ? '运行正常（UDP 已校验地址与路由）' : '运行正常' };
 }
 
-function runtimeFor(rule) {
+const metricFields = ['requests', 'connections', 'bytesIn', 'bytesOut', 'errors', 'lastActivityAt', 'lastSuccessAt', 'lastErrorAt', 'lastError'];
+
+function runtimeFor(rule, seed = null) {
+  const preserved = Object.fromEntries(metricFields.map((field) => [field, seed?.[field] ?? (field.startsWith('last') ? null : 0)]));
   return {
     ruleId: rule.id,
     state: 'starting',
@@ -221,12 +267,18 @@ function runtimeFor(rule) {
     startedAt: null,
     lastCheckAt: null,
     latencyMs: null,
-    requests: 0,
-    connections: 0,
+    requests: preserved.requests,
+    connections: preserved.connections,
     activeConnections: 0,
-    bytesIn: 0,
-    bytesOut: 0,
-    errors: 0,
+    bytesIn: preserved.bytesIn,
+    bytesOut: preserved.bytesOut,
+    errors: preserved.errors,
+    lastActivityAt: preserved.lastActivityAt,
+    lastSuccessAt: preserved.lastSuccessAt,
+    lastErrorAt: preserved.lastErrorAt,
+    lastError: preserved.lastError,
+    recentEvents: Array.isArray(seed?.recentEvents) ? seed.recentEvents.slice(0, 30) : [],
+    clients: new Map(),
     servers: [],
     closers: [],
     sockets: new Set(),
@@ -237,11 +289,50 @@ function runtimeFor(rule) {
   };
 }
 
+function recordEvent(runtime, type, message, meta = {}) {
+  const event = { id: randomUUID(), at: Date.now(), type, message, ...meta };
+  runtime.recentEvents.unshift(event);
+  runtime.recentEvents = runtime.recentEvents.slice(0, 30);
+  runtime.lastActivityAt = event.at;
+  if (type === 'success') runtime.lastSuccessAt = event.at;
+  if (type === 'error') {
+    runtime.lastErrorAt = event.at;
+    runtime.lastError = message;
+  }
+  return event;
+}
+
+function touchClient(runtime, address, protocol, delta = 0) {
+  const normalized = normalizeIp(address) || 'unknown';
+  const key = `${protocol}:${normalized}`;
+  const current = runtime.clients.get(key) || { address: normalized, protocol, active: 0, connections: 0, lastSeenAt: null };
+  if (delta > 0) current.connections += delta;
+  current.active = Math.max(0, current.active + delta);
+  current.lastSeenAt = Date.now();
+  runtime.clients.set(key, current);
+  if (runtime.clients.size > 80) {
+    const oldest = [...runtime.clients.entries()].sort((left, right) => left[1].lastSeenAt - right[1].lastSeenAt).slice(0, runtime.clients.size - 80);
+    for (const [oldestKey] of oldest) runtime.clients.delete(oldestKey);
+  }
+  return () => {
+    const latest = runtime.clients.get(key);
+    if (!latest) return;
+    latest.active = Math.max(0, latest.active - 1);
+    latest.lastSeenAt = Date.now();
+  };
+}
+
+function requestIdFor(request) {
+  const provided = String(request.headers['x-request-id'] || '').trim();
+  return provided && provided.length <= 128 && /^[A-Za-z0-9._:-]+$/.test(provided) ? provided : randomUUID();
+}
+
 export class ProxyManager {
-  constructor({ store, logger, demoMode = false }) {
+  constructor({ store, logger, demoMode = false, notifier = null }) {
     this.store = store;
     this.logger = logger;
     this.demoMode = demoMode;
+    this.notifier = notifier;
     this.runtimes = new Map();
     this.healthTimer = null;
     this.lifecycle = Promise.resolve();
@@ -254,14 +345,15 @@ export class ProxyManager {
   }
 
   async startAllNow() {
+    const seeds = new Map([...this.runtimes.entries()].map(([id, runtime]) => [id, runtime]));
     await this.stopAllNow();
     const failures = [];
     for (const rule of this.store.rules()) {
       if (rule.enabled) {
-        const runtime = await this.startRule(rule);
+        const runtime = await this.startRule(rule, seeds.get(rule.id));
         if (runtime.state === 'error') failures.push({ ruleId: rule.id, rule: rule.name, message: runtime.message });
       }
-      else this.runtimes.set(rule.id, { ...runtimeFor(rule), state: 'disabled', message: '已停用' });
+      else this.runtimes.set(rule.id, { ...runtimeFor(rule, seeds.get(rule.id)), state: 'disabled', message: '已停用' });
     }
     this.scheduleHealthChecks();
     return { ok: failures.length === 0, failures, runtime: this.snapshot() };
@@ -289,7 +381,7 @@ export class ProxyManager {
         const { options } = certificateOptions(this.store, rule.tls.certId);
         if (!bindings.length) {
           if (runtime) await this.closeRuntime(runtime);
-          runtime = await this.startRule(rule);
+           runtime = await this.startRule(rule, runtime);
           if (runtime.state === 'error') throw new Error(runtime.message);
           results.push({ ruleId: rule.id, rule: rule.name, certificateId: rule.tls.certId, action: 'started' });
           continue;
@@ -307,6 +399,7 @@ export class ProxyManager {
         if (runtime) {
           runtime.tlsError = error.message;
           runtime.errors += 1;
+          recordEvent(runtime, 'error', `证书热更新失败：${error.message}`, { protocol: 'tls' });
           runtime.state = retainedContext ? 'warning' : 'error';
           runtime.message = retainedContext
             ? `证书更新失败，继续使用上一 TLS 上下文：${error.message}`
@@ -369,18 +462,21 @@ export class ProxyManager {
 
   stopAll() { return this.runLifecycle(() => this.stopAllNow()); }
 
-  async startRule(rule) {
-    const runtime = runtimeFor(rule);
+  async startRule(rule, seed = null) {
+    const runtime = runtimeFor(rule, seed);
     this.runtimes.set(rule.id, runtime);
     if (this.demoMode) {
-      runtime.state = 'healthy';
-      runtime.message = '运行正常';
+      runtime.state = isRuleScheduleOpen(rule) ? 'healthy' : 'scheduled';
+      runtime.message = runtime.state === 'scheduled' ? '当前不在计划运行时段' : '运行正常';
       runtime.startedAt = Date.now();
       runtime.latencyMs = rule.protocols.includes('tcp') ? 12 : 7;
-      runtime.connections = rule.protocols.includes('udp') && rule.protocols.includes('tcp') ? 28 : rule.protocols.some((protocol) => protocol === 'http' || protocol === 'ws') ? 146 : 9;
-      runtime.requests = rule.protocols.some((protocol) => protocol === 'http' || protocol === 'ws' || protocol === 'https' || protocol === 'wss') ? 483 : 0;
-      runtime.bytesIn = runtime.connections * 9234;
-      runtime.bytesOut = runtime.connections * 18240;
+      runtime.connections = Math.max(runtime.connections, rule.protocols.includes('udp') && rule.protocols.includes('tcp') ? 28 : rule.protocols.some((protocol) => protocol === 'http' || protocol === 'ws') ? 146 : 9);
+      runtime.requests = Math.max(runtime.requests, rule.protocols.some((protocol) => protocol === 'http' || protocol === 'ws' || protocol === 'https' || protocol === 'wss') ? 483 : 0);
+      runtime.bytesIn = Math.max(runtime.bytesIn, runtime.connections * 9234);
+      runtime.bytesOut = Math.max(runtime.bytesOut, runtime.connections * 18240);
+      runtime.lastActivityAt ||= Date.now() - 45_000;
+      runtime.lastSuccessAt ||= Date.now() - 45_000;
+      if (!runtime.recentEvents.length) runtime.recentEvents = [{ id: randomUUID(), at: runtime.lastSuccessAt, type: 'success', message: '目标连接成功', client: '192.168.50.24', protocol: rule.protocols[0], traceId: rule.protocols.some((protocol) => ['http', 'ws', 'https', 'wss'].includes(protocol)) ? randomUUID() : undefined }];
       return runtime;
     }
     try {
@@ -393,15 +489,17 @@ export class ProxyManager {
           if (sourceProtocol === 'udp') await this.startUdp(endpointRule, runtime);
         }
       }
-      runtime.state = 'healthy';
-      runtime.message = '运行正常';
+      runtime.state = isRuleScheduleOpen(rule) ? 'healthy' : 'scheduled';
+      runtime.message = runtime.state === 'scheduled' ? '当前不在计划运行时段' : '运行正常';
       runtime.startedAt = Date.now();
       this.logger.info('代理规则已启动', { ruleId: rule.id, rule: rule.name, listen: `${rule.listenHost}:${listenPortsFor(rule).join(',')}`, protocols: rule.protocols });
     } catch (error) {
       runtime.state = 'error';
       runtime.message = error.code === 'EADDRINUSE' ? '监听端口已被占用' : error.message;
       runtime.errors += 1;
+      recordEvent(runtime, 'error', `规则启动失败：${runtime.message}`, { protocol: rule.protocols.join('+') });
       this.logger.error('代理规则启动失败', { ruleId: rule.id, rule: rule.name, error: error.message, code: error.code });
+      void this.notifier?.send('rule.error', { ruleId: rule.id, rule: rule.name, state: runtime.state, message: runtime.message });
       await this.closeRuntime(runtime);
     }
     return runtime;
@@ -410,6 +508,7 @@ export class ProxyManager {
   async startHttp(rule, runtime) {
     const allowed = accessGuard(rule);
     const outboundRequests = new WeakMap();
+    const requestIds = new WeakMap();
     const rejectedUploads = new WeakSet();
     const proxy = httpProxy.createProxyServer({
       target: targetUrl(rule),
@@ -425,18 +524,23 @@ export class ProxyManager {
       if (rejectedUploads.has(request)) { proxyReq.destroy(); return; }
       try {
         for (const [name, value] of Object.entries(rule.customHeaders)) proxyReq.setHeader(name, value);
+        proxyReq.setHeader('X-Request-ID', requestIds.get(request) || requestIdFor(request));
         if (rule.realIp.enabled && rule.realIp.header) proxyReq.setHeader(rule.realIp.header, normalizeIp(request.socket.remoteAddress));
       } catch (error) {
         this.logger.error('请求头配置无效', { ruleId: rule.id, error: error.message });
         proxyReq.destroy(error);
       }
     });
-    proxy.on('proxyRes', (proxyRes) => {
+    proxy.on('proxyRes', (proxyRes, request, response) => {
       if (rule.hsts && rule.protocol === 'https') proxyRes.headers['strict-transport-security'] = 'max-age=31536000; includeSubDomains';
+      const traceId = requestIds.get(request);
+      if (traceId && response && !response.headersSent) response.setHeader('X-Request-ID', traceId);
     });
     proxy.on('error', (error, req, res) => {
       runtime.errors += 1;
-      this.logger.warn('HTTP 转发失败', { ruleId: rule.id, error: error.message });
+      const traceId = requestIds.get(req);
+      recordEvent(runtime, 'error', `HTTP 转发失败：${error.message}`, { client: normalizeIp(req?.socket?.remoteAddress), protocol: rule.protocol, traceId });
+      this.logger.warn('HTTP 转发失败', { ruleId: rule.id, error: error.message, traceId });
       if (rejectedUploads.has(req)) {
         if (res && typeof res.writeHead === 'function' && !res.headersSent) res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
         if (res && typeof res.end === 'function' && !res.writableEnded) res.end(JSON.stringify({ error: '请求体超过规则限制' }));
@@ -450,9 +554,14 @@ export class ProxyManager {
       }
     });
     const handler = (req, res) => {
+      const traceId = requestIdFor(req);
+      requestIds.set(req, traceId);
+      req.headers['x-request-id'] = traceId;
+      res.setHeader('X-Request-ID', traceId);
+      if (!isRuleScheduleOpen(rule)) { res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '60' }); res.end('代理规则当前处于计划暂停时段'); return; }
       const remote = req.socket.remoteAddress;
       if (!allowed(remote)) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('访问被代理规则拒绝'); return; }
-      if (!domainAllowed(rule, req)) { res.writeHead(421, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('域名与代理规则不匹配'); return; }
+      if (!domainAllowed(rule, req)) { handleUnmatchedHttp(this.store, proxy, req, res); return; }
       const requiredProtocol = rule.protocol === 'https' ? 'https' : 'http';
       if (!rule.protocols.includes(requiredProtocol)) { res.writeHead(426, { 'Content-Type': 'text/plain; charset=utf-8', Upgrade: 'websocket' }); res.end('此入口仅允许 WebSocket 升级'); return; }
       if (rule.forceHttps && rule.protocol === 'http') {
@@ -467,7 +576,19 @@ export class ProxyManager {
       runtime.connections += 1;
       runtime.activeConnections += 1;
       runtime.bytesIn += contentLength;
-      res.on('finish', () => { runtime.activeConnections = Math.max(0, runtime.activeConnections - 1); runtime.bytesOut += Number(res.getHeader('content-length') || 0); });
+      const releaseClient = touchClient(runtime, remote, rule.protocol, 1);
+      recordEvent(runtime, 'activity', `${req.method} ${req.url}`, { client: normalizeIp(remote), protocol: rule.protocol, traceId });
+      let released = false;
+      const finish = () => {
+        if (released) return;
+        released = true;
+        releaseClient();
+        runtime.activeConnections = Math.max(0, runtime.activeConnections - 1);
+        runtime.bytesOut += Number(res.getHeader('content-length') || 0);
+        if (res.statusCode < 500) recordEvent(runtime, 'success', `HTTP ${res.statusCode} ${req.method} ${req.url}`, { client: normalizeIp(remote), protocol: rule.protocol, traceId });
+      };
+      res.once('finish', finish);
+      res.once('close', finish);
       if (rule.uploadLimitMb > 0) {
         const limitBytes = rule.uploadLimitMb * 1024 * 1024;
         let received = 0;
@@ -505,8 +626,12 @@ export class ProxyManager {
     }
     trackServer(runtime, server);
     server.on('upgrade', (req, socket, head) => {
+      const traceId = requestIdFor(req);
+      requestIds.set(req, traceId);
+      req.headers['x-request-id'] = traceId;
+      if (!isRuleScheduleOpen(rule)) { rejectUpgrade(socket, '503 Service Unavailable', '代理规则当前处于计划暂停时段', { 'Retry-After': '60' }); return; }
       if (!allowed(req.socket.remoteAddress)) { rejectUpgrade(socket, '403 Forbidden', '访问被代理规则拒绝'); return; }
-      if (!domainAllowed(rule, req)) { rejectUpgrade(socket, '421 Misdirected Request', '域名与代理规则不匹配'); return; }
+      if (!domainAllowed(rule, req)) { handleUnmatchedUpgrade(this.store, proxy, req, socket, head); return; }
       const requiredProtocol = rule.protocol === 'https' ? 'wss' : 'ws';
       if (!rule.protocols.includes(requiredProtocol)) { rejectUpgrade(socket, '426 Upgrade Required', '此入口未启用 WebSocket'); return; }
       if (rule.forceHttps && rule.protocol === 'http') {
@@ -516,7 +641,9 @@ export class ProxyManager {
       }
       runtime.connections += 1;
       runtime.activeConnections += 1;
-      socket.on('close', () => { runtime.activeConnections = Math.max(0, runtime.activeConnections - 1); });
+      const releaseClient = touchClient(runtime, req.socket.remoteAddress, rule.protocol === 'https' ? 'wss' : 'ws', 1);
+      recordEvent(runtime, 'activity', `WebSocket ${req.url}`, { client: normalizeIp(req.socket.remoteAddress), protocol: rule.protocol === 'https' ? 'wss' : 'ws', traceId });
+      socket.on('close', () => { runtime.activeConnections = Math.max(0, runtime.activeConnections - 1); releaseClient(); });
       proxy.ws(req, socket, head);
     });
     await waitForListen(server, rule.listenPort, rule.listenHost);
@@ -527,17 +654,21 @@ export class ProxyManager {
   async startTcp(rule, runtime) {
     const allowed = accessGuard(rule);
     const server = net.createServer((client) => {
+      if (!isRuleScheduleOpen(rule)) { client.destroy(); return; }
       if (!allowed(client.remoteAddress)) { client.destroy(); return; }
       runtime.connections += 1;
       runtime.activeConnections += 1;
+      const releaseClient = touchClient(runtime, client.remoteAddress, 'tcp', 1);
+      recordEvent(runtime, 'activity', `TCP 连接 ${normalizeIp(client.remoteAddress)}`, { client: normalizeIp(client.remoteAddress), protocol: 'tcp' });
       const upstream = trackStream(runtime, net.createConnection({ host: rule.targetHost, port: rule.targetPort }));
       client.setTimeout(rule.timeoutMs, () => client.destroy());
       upstream.setTimeout(rule.timeoutMs, () => upstream.destroy());
       client.on('data', (chunk) => { runtime.bytesIn += chunk.length; });
       upstream.on('data', (chunk) => { runtime.bytesOut += chunk.length; });
-      upstream.on('error', (error) => { runtime.errors += 1; this.logger.warn('TCP 目标连接失败', { ruleId: rule.id, error: error.message }); client.destroy(); });
+      upstream.once('connect', () => recordEvent(runtime, 'success', `TCP 已连接目标 ${rule.targetHost}:${rule.targetPort}`, { client: normalizeIp(client.remoteAddress), protocol: 'tcp' }));
+      upstream.on('error', (error) => { runtime.errors += 1; recordEvent(runtime, 'error', `TCP 目标连接失败：${error.message}`, { client: normalizeIp(client.remoteAddress), protocol: 'tcp' }); this.logger.warn('TCP 目标连接失败', { ruleId: rule.id, error: error.message }); client.destroy(); });
       client.on('error', () => {});
-      client.on('close', () => { runtime.activeConnections = Math.max(0, runtime.activeConnections - 1); upstream.destroy(); });
+      client.on('close', () => { runtime.activeConnections = Math.max(0, runtime.activeConnections - 1); releaseClient(); upstream.destroy(); });
       client.pipe(upstream).pipe(client);
     });
     trackServer(runtime, server);
@@ -568,6 +699,9 @@ export class ProxyManager {
       let closePromise = null;
       let connected = false;
       let pending = [];
+      runtime.activeConnections += 1;
+      const releaseClient = touchClient(runtime, client.address, 'udp', 1);
+      recordEvent(runtime, 'activity', `UDP 会话 ${normalizeIp(client.address)}:${client.port}`, { client: normalizeIp(client.address), protocol: 'udp' });
       const session = {
         socket: upstream,
         timer: null,
@@ -579,6 +713,8 @@ export class ProxyManager {
           closePromise = closeDatagram(upstream).finally(() => {
             if (runtime.udpSessions.get(key) === session) runtime.udpSessions.delete(key);
             runtime.datagramSockets.delete(upstream);
+            runtime.activeConnections = Math.max(0, runtime.activeConnections - 1);
+            releaseClient();
           });
           return closePromise;
         },
@@ -588,6 +724,7 @@ export class ProxyManager {
           if (!connected) {
             if (pending.length >= MAX_PENDING_UDP_DATAGRAMS_PER_SESSION) {
               runtime.errors += 1;
+              recordEvent(runtime, 'error', 'UDP 会话等待队列已满', { client: normalizeIp(client.address), protocol: 'udp' });
               this.logger.warn('UDP 会话等待队列已满', { ruleId: rule.id, client: `${client.address}:${client.port}`, limit: MAX_PENDING_UDP_DATAGRAMS_PER_SESSION });
               return;
             }
@@ -597,6 +734,7 @@ export class ProxyManager {
           upstream.send(message, (error) => {
             if (!error || closed) return;
             runtime.errors += 1;
+            recordEvent(runtime, 'error', `UDP 数据报发送失败：${error.message}`, { client: normalizeIp(client.address), protocol: 'udp' });
             this.logger.warn('UDP 数据报发送失败', { ruleId: rule.id, error: error.message });
             void session.close();
           });
@@ -605,6 +743,7 @@ export class ProxyManager {
       const failSession = (message, error) => {
         if (closed) return;
         runtime.errors += 1;
+        recordEvent(runtime, 'error', `${message}：${error.message}`, { client: normalizeIp(client.address), protocol: 'udp' });
         this.logger.warn(message, { ruleId: rule.id, error: error.message });
         void session.close();
       };
@@ -624,10 +763,12 @@ export class ProxyManager {
         if (closed) return;
         touchSession(session);
         runtime.bytesOut += reply.length;
+        recordEvent(runtime, 'success', `UDP 收到目标回复（${reply.length} B）`, { client: normalizeIp(client.address), protocol: 'udp' });
         try {
           socket.send(reply, client.port, client.address, (error) => {
             if (!error || closed) return;
             runtime.errors += 1;
+            recordEvent(runtime, 'error', `UDP 回复发送失败：${error.message}`, { client: normalizeIp(client.address), protocol: 'udp' });
             this.logger.warn('UDP 回复发送失败', { ruleId: rule.id, error: error.message });
             void session.close();
           });
@@ -653,11 +794,13 @@ export class ProxyManager {
     runtime.datagramSockets.add(socket);
     socket.once('close', () => runtime.datagramSockets.delete(socket));
     socket.on('message', (message, client) => {
+      if (!isRuleScheduleOpen(rule)) return;
       if (!allowed(client.address)) return;
       const key = sessionKeyFor(client);
       let session = runtime.udpSessions.get(key);
       if (!session && runtime.udpSessions.size >= MAX_UDP_UPSTREAMS_PER_RULE) {
         runtime.errors += 1;
+        recordEvent(runtime, 'error', 'UDP 转发资源已达上限', { client: normalizeIp(client.address), protocol: 'udp' });
         this.logger.warn('UDP 转发资源已达上限', { ruleId: rule.id, limit: MAX_UDP_UPSTREAMS_PER_RULE });
         return;
       }
@@ -665,9 +808,10 @@ export class ProxyManager {
       if (!session) return;
       runtime.connections += 1;
       runtime.bytesIn += message.length;
+      runtime.lastActivityAt = Date.now();
       session.send(message);
     });
-    socket.on('error', (error) => { runtime.errors += 1; this.logger.warn('UDP 监听异常', { ruleId: rule.id, error: error.message }); });
+    socket.on('error', (error) => { runtime.errors += 1; recordEvent(runtime, 'error', `UDP 监听异常：${error.message}`, { protocol: 'udp' }); this.logger.warn('UDP 监听异常', { ruleId: rule.id, error: error.message }); });
     await new Promise((resolve, reject) => {
       socket.once('error', reject);
       socket.bind(rule.listenPort, rule.listenHost, () => { socket.off('error', reject); resolve(); });
@@ -677,6 +821,12 @@ export class ProxyManager {
   async checkRule(rule) {
     const runtime = this.runtimes.get(rule.id);
     if (!rule.enabled || !runtime || runtime.state === 'error') return runtime;
+    if (!isRuleScheduleOpen(rule)) {
+      runtime.lastCheckAt = Date.now();
+      runtime.state = 'scheduled';
+      runtime.message = '当前不在计划运行时段';
+      return runtime;
+    }
     if (this.demoMode) {
       runtime.lastCheckAt = Date.now();
       runtime.state = 'healthy';
@@ -695,6 +845,7 @@ export class ProxyManager {
       }
     }
     const result = await probeEndpoints(endpoints, Math.min(rule.timeoutMs, 5000));
+    const previousState = runtime.state;
     runtime.lastCheckAt = Date.now();
     runtime.latencyMs = Math.max(1, Math.round(performance.now() - started));
     if (runtime.tlsError) {
@@ -703,6 +854,11 @@ export class ProxyManager {
     } else {
       runtime.state = result.ok ? 'healthy' : 'warning';
       runtime.message = result.ok ? result.message : `目标异常：${result.message}`;
+    }
+    if (runtime.state !== previousState) {
+      recordEvent(runtime, runtime.state === 'healthy' ? 'success' : 'error', runtime.message, { protocol: rule.targetProtocols.join('+') });
+      if (runtime.state === 'warning') void this.notifier?.send('rule.error', { ruleId: rule.id, rule: rule.name, state: runtime.state, message: runtime.message });
+      if (runtime.state === 'healthy' && ['warning', 'error'].includes(previousState)) void this.notifier?.send('rule.recovered', { ruleId: rule.id, rule: rule.name, state: runtime.state, message: runtime.message });
     }
     return runtime;
   }
@@ -727,7 +883,12 @@ export class ProxyManager {
   }
 
   publicRuntime(runtime) {
-    const { servers, closers, sockets, datagramSockets, udpSessions, tlsBindings, ...publicData } = runtime;
-    return publicData;
+    const { servers, closers, sockets, datagramSockets, udpSessions, tlsBindings, clients, ...publicData } = runtime;
+    return {
+      ...publicData,
+      clients: [...(clients?.values?.() || [])]
+        .sort((left, right) => right.active - left.active || right.lastSeenAt - left.lastSeenAt)
+        .slice(0, 20),
+    };
   }
 }

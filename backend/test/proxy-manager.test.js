@@ -50,8 +50,8 @@ const freePortRange = async (width = 2) => {
   throw new Error('No free consecutive port range');
 };
 
-test('forwards HTTP requests and custom headers', async () => {
-  const target = http.createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ url: req.url, header: req.headers['x-proxy-test'] })); });
+test('forwards HTTP requests with custom headers and a trace ID', async () => {
+  const target = http.createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ url: req.url, header: req.headers['x-proxy-test'], traceId: req.headers['x-request-id'] })); });
   const targetPort = await listen(target);
   const proxyPort = await freePort();
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-http-'));
@@ -62,7 +62,15 @@ test('forwards HTTP requests and custom headers', async () => {
     await manager.startAll();
     const response = await fetch(`http://127.0.0.1:${proxyPort}/hello?value=1`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { url: '/hello?value=1', header: 'working' });
+    const payload = await response.json();
+    assert.equal(payload.url, '/hello?value=1');
+    assert.equal(payload.header, 'working');
+    assert.match(payload.traceId, /^[0-9a-f-]{36}$/);
+    assert.equal(response.headers.get('x-request-id'), payload.traceId);
+    const runtime = manager.snapshot().rules[store.rules()[0].id];
+    assert.equal(runtime.lastSuccessAt > 0, true);
+    assert.equal(runtime.clients[0].address, '127.0.0.1');
+    assert.equal(runtime.recentEvents.some((event) => event.traceId === payload.traceId), true);
   } finally {
     await manager.stopAll(); await close(target); fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -295,7 +303,26 @@ test('applies domain policy to WebSocket upgrades', async () => {
   try {
     await manager.startAll();
     const response = await rawRequest(proxyPort, 'GET /socket HTTP/1.1\r\nHost: blocked.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n');
-    assert.match(response, /^HTTP\/1\.1 421 /);
+    assert.match(response, /^HTTP\/1\.1 404 /);
+  } finally {
+    await manager.stopAll(); await close(target); fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('keeps scheduled listeners ready while rejecting traffic outside the window', async () => {
+  const target = http.createServer((req, res) => res.end('unexpected'));
+  const targetPort = await listen(target);
+  const proxyPort = await freePort();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-schedule-'));
+  const store = new ConfigStore(directory); store.load();
+  const excludedDay = (new Date().getDay() + 1) % 7;
+  const rule = store.createRule({ name: 'Scheduled', protocol: 'http', listenHost: '127.0.0.1', listenPort: proxyPort, targetProtocol: 'http', targetHost: '127.0.0.1', targetPort, schedule: { enabled: true, days: [excludedDay], start: '00:00', end: '23:59' } });
+  const manager = new ProxyManager({ store, logger });
+  try {
+    await manager.startAll();
+    assert.equal(manager.snapshot().rules[rule.id].state, 'scheduled');
+    const response = await fetch(`http://127.0.0.1:${proxyPort}/`);
+    assert.equal(response.status, 503);
   } finally {
     await manager.stopAll(); await close(target); fs.rmSync(directory, { recursive: true, force: true });
   }
@@ -307,7 +334,7 @@ test('reload closes active TCP streams instead of hanging', async () => {
   const proxyPort = await freePort();
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-active-reload-'));
   const store = new ConfigStore(directory); store.load();
-  store.createRule({ name: 'Active stream', protocol: 'tcp', listenHost: '127.0.0.1', listenPort: proxyPort, targetProtocol: 'tcp', targetHost: '127.0.0.1', targetPort });
+  const rule = store.createRule({ name: 'Active stream', protocol: 'tcp', listenHost: '127.0.0.1', listenPort: proxyPort, targetProtocol: 'tcp', targetHost: '127.0.0.1', targetPort });
   const manager = new ProxyManager({ store, logger });
   const client = new net.Socket();
   try {
@@ -315,6 +342,7 @@ test('reload closes active TCP streams instead of hanging', async () => {
     await new Promise((resolve, reject) => { client.once('error', reject); client.connect(proxyPort, '127.0.0.1', resolve); });
     const result = await Promise.race([manager.reload().then(() => 'reloaded'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 1000))]);
     assert.equal(result, 'reloaded');
+    assert.equal(manager.snapshot().rules[rule.id].connections, 1);
   } finally {
     client.destroy(); await manager.stopAll(); await close(target); fs.rmSync(directory, { recursive: true, force: true });
   }

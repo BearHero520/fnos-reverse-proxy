@@ -1,5 +1,5 @@
 appname               = reverse-proxy
-version               = 1.0.4
+version               = 1.0.16
 display_name          = 反向代理
 desc                  = 为飞牛 fnOS 打造的易用型多协议反向代理工具。支持协议组合、连续端口范围、多格式证书自动解析、访问控制、健康检查、日志、导入导出和配置热加载。
 platform              = all
@@ -13,4 +13,4 @@ checkport             = false
 disable_authorization_path = true
 desktop_uidir         = ui
 desktop_applaunchname = reverse-proxy.main
-changelog             = v1.0.4 修复规则操作菜单遮挡与启停开关变形
+changelog             = v1.0.16 优化系统 HTTPS 证书卡片的间距、信息层级和窄屏按钮布局。

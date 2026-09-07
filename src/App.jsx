@@ -1,11 +1,18 @@
+import { UISelect } from './UISelect.jsx';
 import { Dialog } from '@base-ui/react/dialog';
 import { Popover } from '@base-ui/react/popover';
 import { cloneElement, isValidElement, useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, apiUrl } from './api.js';
+import { DdnsPage, IssuancePage, emptyDdns, emptyIssuance } from './AutomationPages.jsx';
+import { FnosDeploymentPage, emptyDeployment } from './FnosDeploymentPage.jsx';
+import { version as APP_VERSION } from '../package.json';
 
 const ROUTES = {
   rules: { label: '代理规则', icon: 'bi-diagram-3', title: '代理规则', description: '查看来源到目标的实际流向，集中管理全部转发。' },
-  certificates: { label: '证书', icon: 'bi-shield-lock', title: '证书', description: '仅在本应用接收并解密 HTTPS / WSS 时使用；TCP / UDP 原样转发不需要证书。' },
+  certificates: { label: '域名与证书', icon: 'bi-shield-lock', title: '域名与证书', description: '导入或申请域名证书，用于代理 HTTPS 或 NAS 后台。' },
+  issuance: { label: '证书签发', icon: 'bi-shield-plus', title: '证书签发', description: '自动申请证书，到期前轮换并热更新代理规则。' },
+  ddns: { label: 'DDNS', icon: 'bi-broadcast-pin', title: 'DDNS 同步', description: '独立管理公网地址同步，不影响证书签发。' },
+  deployment: { label: '系统 HTTPS', icon: 'bi-shield-lock', title: '域名与证书', description: '管理 NAS 后台使用的证书，替换前自动校验并备份。' },
   logs: { label: '日志', icon: 'bi-file-earmark-text', title: '日志', description: '查看运行事件，快速定位监听与目标连接问题。' },
   settings: { label: '设置', icon: 'bi-gear', title: '设置', description: '调整检测频率、备份配置并查看系统信息。' },
   about: { label: '关于', icon: 'bi-info-circle', title: '关于', description: '查看版本、项目地址与许可信息。' },
@@ -13,12 +20,14 @@ const ROUTES = {
 
 const PROJECT_URL = 'https://github.com/BearHero520/fnos-reverse-proxy';
 
+
 const blankRule = {
   name: '', protocol: 'http', protocols: ['http'], listenHost: '0.0.0.0', listenPort: 8080, listenPortStart: 8080, listenPortEnd: 8080, listenPorts: [8080], listenPortsText: '8080', domains: [],
   targetProtocol: 'http', targetProtocols: ['http'], targetHost: '127.0.0.1', targetPort: 80, targetPortStart: 80, targetPortEnd: 80, targetPorts: [80], targetPortsText: '80', enabled: true,
   timeoutMs: 30000, uploadLimitMb: 50, preserveHost: false, hsts: false, forceHttps: false,
   rejectUnauthorized: true, customHeaders: {}, allowIps: [], blockIps: [],
   realIp: { enabled: true, header: 'X-Forwarded-For' }, tls: { certId: '' },
+  schedule: { enabled: false, days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '23:59' },
 };
 
 const protocolLabels = { http: 'HTTP', ws: 'WebSocket', https: 'HTTPS', wss: 'WSS', tcp: 'TCP', udp: 'UDP', 'tcp+udp': 'TCP + UDP' };
@@ -63,7 +72,11 @@ const targetDisabledReasons = (source = [], targets = []) => {
     return [protocol, reason];
   }));
 };
-const stateLabels = { healthy: '正常', warning: '目标异常', error: '启动失败', disabled: '已停用', starting: '加载中' };
+const stateLabels = { healthy: '正常', warning: '目标异常', error: '启动失败', disabled: '已停用', scheduled: '计划暂停', starting: '加载中' };
+const weekdayLabels = [['1', '一'], ['2', '二'], ['3', '三'], ['4', '四'], ['5', '五'], ['6', '六'], ['0', '日']];
+const webhookEventOptions = [
+  ['rule.error', '规则异常'], ['rule.recovered', '规则恢复'], ['certificate.expiring', '证书临期'], ['certificate.updated', '证书更新'],
+];
 const lines = (value) => Array.isArray(value) ? value.join('\n') : String(value || '');
 const parseLines = (value) => [...new Set(String(value || '').split(/[\n,]/).map((item) => item.trim()).filter(Boolean))];
 const headersToText = (value = {}) => Object.entries(value).map(([key, item]) => `${key}: ${item}`).join('\n');
@@ -216,8 +229,8 @@ function Sidebar({ route, onNavigate, serviceState, version }) {
   const serviceDetail = serviceState === 'loading' ? '正在连接管理服务' : serviceState === 'healthy' ? '系统运行正常' : '请检查管理服务';
   return <aside className="sidebar">
     <div className="brand"><span className="brand-mark"><i className="bi bi-signpost-split-fill" aria-hidden="true" /></span><div><strong>反向代理管理器</strong><small>Reverse Proxy</small></div></div>
-    <nav className="nav-list" aria-label="主导航">{Object.entries(ROUTES).map(([key, item]) => <button key={key} type="button" className={`nav-item${route === key ? ' active' : ''}`} aria-current={route === key ? 'page' : undefined} onClick={() => onNavigate(key)}><i className={`bi ${item.icon}`} aria-hidden="true" /><span>{item.label}</span></button>)}</nav>
-    <footer className="sidebar-footer"><div className={`sidebar-health ${serviceState}`}><span><i className={`status-dot ${serviceState === 'healthy' ? 'online' : serviceState === 'loading' ? 'warning' : 'offline'}`} aria-hidden="true" />{serviceLabel}</span><small>{serviceDetail} · v{version || '1.0.4'}</small></div></footer>
+    <nav className="nav-list" aria-label="主导航">{Object.entries(ROUTES).filter(([key]) => !['issuance', 'deployment'].includes(key)).map(([key, item]) => <button key={key} type="button" className={`nav-item${route === key || key === 'certificates' && ['issuance', 'deployment'].includes(route) ? ' active' : ''}`} aria-current={route === key ? 'page' : undefined} onClick={() => onNavigate(key)}><i className={`bi ${item.icon}`} aria-hidden="true" /><span>{item.label}</span></button>)}</nav>
+    <footer className="sidebar-footer"><div className={`sidebar-health ${serviceState}`}><span><i className={`status-dot ${serviceState === 'healthy' ? 'online' : serviceState === 'loading' ? 'warning' : 'offline'}`} aria-hidden="true" />{serviceLabel}</span><small>{serviceDetail} · v{version || APP_VERSION}</small></div></footer>
   </aside>;
 }
 
@@ -239,7 +252,23 @@ function ProtocolBadges({ protocols }) {
   return <span className="protocol-stack">{protocols.map((protocol) => <span className={`protocol-badge ${protocol}`} key={protocol}>{protocol.toUpperCase()}</span>)}</span>;
 }
 
-function RuleActionMenu({ rule, pending, testUnavailable, onToggle: onRuleToggle, onTest, onEdit, onDuplicate, onDelete }) {
+const formatBytes = (value = 0) => {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+};
+const formatMoment = (value) => value ? new Date(value).toLocaleString() : '暂无';
+
+function RuntimeDialog({ rule, runtime, onClose }) {
+  const item = runtime || {};
+  const events = item.recentEvents || [];
+  const clients = item.clients || [];
+  return <Dialog.Root open={Boolean(rule)} onOpenChange={(open) => { if (!open) onClose(); }}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Popup className="dialog-popup runtime-dialog"><header className="dialog-header"><div><span className="section-kicker">RUNTIME DETAILS</span><Dialog.Title>{rule?.name || '规则'} · 运行详情</Dialog.Title><Dialog.Description>累计指标在重载后继续保留；最近事件中的追踪 ID 可直接用于日志检索。</Dialog.Description></div><Dialog.Close className="dialog-close" aria-label="关闭"><i className="bi bi-x-lg" aria-hidden="true" /></Dialog.Close></header><div className="dialog-body runtime-body"><div className="runtime-overview"><div><small>当前状态</small><StatusChip state={item.state || 'starting'} /></div><div><small>当前连接</small><strong>{item.activeConnections || 0}</strong></div><div><small>累计连接</small><strong>{item.connections || 0}</strong></div><div><small>HTTP 请求</small><strong>{item.requests || 0}</strong></div><div><small>流入</small><strong>{formatBytes(item.bytesIn)}</strong></div><div><small>流出</small><strong>{formatBytes(item.bytesOut)}</strong></div><div><small>错误</small><strong className={item.errors ? 'danger-text' : ''}>{item.errors || 0}</strong></div><div><small>目标延迟</small><strong>{item.latencyMs ? `${item.latencyMs} ms` : '—'}</strong></div></div><dl className="runtime-facts"><div><dt>启动时间</dt><dd>{formatMoment(item.startedAt)}</dd></div><div><dt>最近活动</dt><dd>{formatMoment(item.lastActivityAt)}</dd></div><div><dt>最近成功</dt><dd>{formatMoment(item.lastSuccessAt)}</dd></div><div><dt>最近检查</dt><dd>{formatMoment(item.lastCheckAt)}</dd></div>{item.lastError ? <div className="runtime-last-error"><dt>最近错误</dt><dd>{item.lastError}<small>{formatMoment(item.lastErrorAt)}</small></dd></div> : null}</dl><section className="runtime-section"><header><h3>当前与最近客户端</h3><span>{clients.filter((client) => client.active).length} 个活跃</span></header><div className="runtime-client-list">{clients.map((client) => <article key={`${client.protocol}-${client.address}`}><span className={`client-protocol ${client.protocol}`}>{String(client.protocol || 'tcp').toUpperCase()}</span><code>{client.address}</code><small>{client.active ? `${client.active} 个当前连接` : `最近 ${formatMoment(client.lastSeenAt)}`} · 累计 {client.connections}</small></article>)}{!clients.length ? <p className="runtime-empty">暂无客户端活动</p> : null}</div></section><section className="runtime-section"><header><h3>最近事件</h3><span>最多保留 30 条</span></header><div className="runtime-event-list">{events.map((event) => <article key={event.id}><i className={`bi ${event.type === 'error' ? 'bi-exclamation-circle' : event.type === 'success' ? 'bi-check-circle' : 'bi-arrow-left-right'}`} aria-hidden="true" /><div><strong>{event.message}</strong><small>{formatMoment(event.at)}{event.client ? ` · ${event.client}` : ''}</small>{event.traceId ? <code title="复制后可在日志中搜索">Trace {event.traceId}</code> : null}</div></article>)}{!events.length ? <p className="runtime-empty">暂无运行事件</p> : null}</div></section></div><footer className="dialog-actions"><Dialog.Close className="secondary-button">关闭</Dialog.Close></footer></Dialog.Popup></Dialog.Portal></Dialog.Root>;
+}
+
+function RuleActionMenu({ rule, pending, testUnavailable, onToggle: onRuleToggle, onTest, onDetails, onEdit, onDuplicate, onDelete }) {
   const [open, setOpen] = useState(false);
   const run = (action) => {
     setOpen(false);
@@ -253,6 +282,7 @@ function RuleActionMenu({ rule, pending, testUnavailable, onToggle: onRuleToggle
           <span className="menu-toggle"><span>{rule.enabled ? '规则已启用' : '规则已停用'}</span><Toggle checked={rule.enabled} label={`${rule.enabled ? '停用' : '启用'} ${rule.name}`} disabled={pending} onChange={(enabled) => run(() => onRuleToggle(rule, enabled))} /></span>
           <button type="button" className="action-menu-action" disabled={pending || testUnavailable} aria-describedby={testUnavailable ? `test-help-${rule.id}` : undefined} onClick={() => run(() => onTest(rule))}><i className="bi bi-activity" aria-hidden="true" />测试目标</button>
           {testUnavailable ? <p className="menu-help" id={`test-help-${rule.id}`}>规则正常运行后才能测试目标。</p> : null}
+          <button type="button" className="action-menu-action" onClick={() => run(() => onDetails(rule))}><i className="bi bi-speedometer2" aria-hidden="true" />运行详情</button>
           <button type="button" className="action-menu-action" onClick={() => run(() => onEdit(rule))}><i className="bi bi-pencil" aria-hidden="true" />编辑规则</button>
           <button type="button" className="action-menu-action" disabled={pending} onClick={() => run(() => onDuplicate(rule))}><i className="bi bi-copy" aria-hidden="true" />创建副本</button>
           <button type="button" className="action-menu-action danger" disabled={pending} onClick={() => run(() => onDelete(rule))}><i className="bi bi-trash3" aria-hidden="true" />删除规则</button>
@@ -262,9 +292,12 @@ function RuleActionMenu({ rule, pending, testUnavailable, onToggle: onRuleToggle
   </Popover.Root>;
 }
 
-function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDuplicate, onDelete, onTest, busy }) {
+function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDuplicate, onDelete, onTest, onBatch, busy }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selected, setSelected] = useState(() => new Set());
+  const [detailsRule, setDetailsRule] = useState(null);
   const deferredQuery = useDeferredValue(query.toLowerCase());
   const visible = useMemo(() => rules.filter((rule) => {
     const protocols = ruleProtocols(rule);
@@ -272,10 +305,20 @@ function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDupli
     const searchable = `${rule.name} ${protocols.join(' ')} ${rule.listenHost} ${portsForRule(rule, 'listen').join(' ')} ${rule.targetHost} ${portsForRule(rule, 'target').join(' ')} ${(rule.domains || []).join(' ')}`.toLowerCase();
     return matchesFilter && (!deferredQuery || searchable.includes(deferredQuery));
   }), [rules, filter, deferredQuery]);
+  useEffect(() => setSelected((current) => new Set([...current].filter((id) => rules.some((rule) => rule.id === id)))), [rules]);
+  const toggleSelected = (id) => setSelected((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  const leaveSelection = () => { setSelectionMode(false); setSelected(new Set()); };
+  const runBatch = async (action) => {
+    if (!selected.size) return;
+    const result = await onBatch([...selected], action);
+    if (result === true) leaveSelection();
+  };
+  const allVisibleSelected = visible.length > 0 && visible.every((rule) => selected.has(rule.id));
   return <section className="view rules-view" aria-label="代理规则">
     <article className="matte-surface rules-surface">
-      <header className="rules-heading"><div><span>代理规则</span><StatusChip state={!status?.ok ? 'error' : status?.rules?.warning ? 'warning' : 'healthy'} label={!status?.ok ? '服务不可用' : status?.rules?.warning ? `${status.rules.warning} 个异常` : `${status?.rules?.healthy || 0} 个运行中`} /></div><button type="button" className="primary-button" onClick={onCreate}><i className="bi bi-plus-lg" aria-hidden="true" />新建规则</button></header>
+      <header className="rules-heading"><div><span>代理规则</span><StatusChip state={!status?.ok ? 'error' : status?.rules?.warning ? 'warning' : 'healthy'} label={!status?.ok ? '服务不可用' : status?.rules?.warning ? `${status.rules.warning} 个异常` : `${status?.rules?.healthy || 0} 个运行中`} /></div><span className="rules-heading-actions"><button type="button" className="secondary-button" onClick={() => selectionMode ? leaveSelection() : setSelectionMode(true)}><i className={`bi ${selectionMode ? 'bi-x-lg' : 'bi-check2-square'}`} aria-hidden="true" />{selectionMode ? '退出批量' : '批量管理'}</button><button type="button" className="primary-button" onClick={onCreate}><i className="bi bi-plus-lg" aria-hidden="true" />新建规则</button></span></header>
       <div className="rules-toolbar"><div className="search-box"><i className="bi bi-search" aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索规则" placeholder="搜索名称、域名、IP 或端口" /></div><div className="filter-tabs" aria-label="规则筛选">{[['all', '全部'], ['enabled', '已启用'], ['http', 'HTTP'], ['tcp', 'TCP'], ['udp', 'UDP'], ['disabled', '已停用']].map(([value, label]) => <button type="button" key={value} className={filter === value ? 'active' : ''} aria-pressed={filter === value} onClick={() => setFilter(value)}>{label}</button>)}</div></div>
+      {selectionMode ? <div className="batch-bar"><label><input type="checkbox" checked={allVisibleSelected} onChange={() => setSelected((current) => { const next = new Set(current); visible.forEach((rule) => allVisibleSelected ? next.delete(rule.id) : next.add(rule.id)); return next; })} />选择当前 {visible.length} 条</label><span>已选 {selected.size} 条</span><div><button type="button" className="secondary-button" disabled={!selected.size || busy.has('batch-rules')} onClick={() => void runBatch('enable')}>启用</button><button type="button" className="secondary-button" disabled={!selected.size || busy.has('batch-rules')} onClick={() => void runBatch('disable')}>停用</button><button type="button" className="danger-button" disabled={!selected.size || busy.has('batch-rules')} onClick={() => void runBatch('delete')}>删除</button></div></div> : null}
       <div className="rule-list" role="list">{visible.map((rule) => {
         const item = runtime?.[rule.id] || { state: rule.enabled ? 'starting' : 'disabled' };
         const protocols = ruleProtocols(rule);
@@ -283,19 +326,20 @@ function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDupli
         const universal = isUniversalPair(protocols, targetProtocols);
         const pending = busy.has(rule.id);
         const visibleState = pending ? 'starting' : item.state;
-        const testUnavailable = !rule.enabled || ['disabled', 'error', 'starting'].includes(item.state);
-        return <article className="rule-item" role="listitem" key={rule.id}>
-          <button type="button" className="rule-flow" onClick={() => onEdit(rule)} aria-label={`编辑规则 ${rule.name}；${universal ? 'TCP、UDP 原样转发' : `协议 ${protocols.map((protocol) => protocolLabels[protocol]).join('、')}`}；来源 ${rule.listenHost}:${portListLabel(rule, 'listen')}；目标 ${rule.targetHost}:${portListLabel(rule, 'target')}；状态 ${stateLabels[visibleState] || visibleState}`}>
+        const testUnavailable = !rule.enabled || ['disabled', 'scheduled', 'error', 'starting'].includes(item.state);
+        return <article className={`rule-item${selected.has(rule.id) ? ' selected' : ''}`} role="listitem" key={rule.id}>
+          {selectionMode ? <label className="batch-selector" title={`选择 ${rule.name}`}><input type="checkbox" checked={selected.has(rule.id)} onChange={() => toggleSelected(rule.id)} aria-label={`选择 ${rule.name}`} /></label> : null}
+          <button type="button" className="rule-flow" onClick={() => selectionMode ? toggleSelected(rule.id) : onEdit(rule)} aria-label={`${selectionMode ? '选择' : '编辑'}规则 ${rule.name}；${universal ? 'TCP、UDP 原样转发' : `协议 ${protocols.map((protocol) => protocolLabels[protocol]).join('、')}`}；来源 ${rule.listenHost}:${portListLabel(rule, 'listen')}；目标 ${rule.targetHost}:${portListLabel(rule, 'target')}；状态 ${stateLabels[visibleState] || visibleState}`}>
             <span className="rule-identity"><ProtocolBadges protocols={protocols} /><span><strong>{rule.name}</strong><small>{universal ? 'TCP + UDP 原样转发' : (rule.domains || []).length ? rule.domains.join('、') : protocols.map((protocol) => protocolLabels[protocol]).join(' · ')}</small></span></span>
             <span className="flow-endpoint source"><small>来源</small><code>{rule.listenHost === '0.0.0.0' ? '所有地址' : rule.listenHost}<b>:{portListLabel(rule, 'listen')}</b></code></span>
             <span className="flow-arrow"><i className="bi bi-arrow-right" aria-hidden="true" /></span>
             <span className="flow-endpoint target"><small>{universal ? '原样转发' : targetProtocols.map((protocol) => protocol.toUpperCase()).join(' · ')}</small><code>{rule.targetHost}<b>:{portListLabel(rule, 'target')}</b></code></span>
             <span className="rule-state"><StatusChip state={visibleState} message={pending ? '正在等待服务器确认' : item.message} />{pending ? <small>正在等待服务器确认</small> : item.message && !['healthy', 'disabled'].includes(item.state) ? <small>{item.message}</small> : <small>{item.activeConnections || 0} 当前 · {item.connections || 0} 累计</small>}</span>
           </button>
-          <RuleActionMenu rule={rule} pending={pending} testUnavailable={testUnavailable} onToggle={onToggle} onTest={onTest} onEdit={onEdit} onDuplicate={onDuplicate} onDelete={onDelete} />
+          {!selectionMode ? <RuleActionMenu rule={rule} pending={pending} testUnavailable={testUnavailable} onToggle={onToggle} onTest={onTest} onDetails={setDetailsRule} onEdit={onEdit} onDuplicate={onDuplicate} onDelete={onDelete} /> : null}
         </article>;
       })}{!visible.length ? <EmptyState icon="bi-inboxes" title="没有符合条件的规则" description="调整搜索或筛选条件，或者新建一条规则。" action="新建规则" onAction={onCreate} /> : null}</div>
-    </article>
+    </article><RuntimeDialog rule={detailsRule} runtime={detailsRule ? runtime?.[detailsRule.id] : null} onClose={() => setDetailsRule(null)} />
   </section>;
 }
 
@@ -357,13 +401,31 @@ function PortMappingPreview({ sourceText, targetText, targetHost, universal = fa
   return <div className="port-mapping-preview"><div className="port-mapping-head"><span><i className="bi bi-diagram-3" aria-hidden="true" />{universal ? 'TCP + UDP 端口映射' : '实时端口映射'}</span><small>{target.ports.length === 1 && source.ports.length > 1 ? `${source.ports.length} 个入口共用 1 个目标` : `${source.ports.length} 组一一映射`}</small></div><div className="port-mapping-list">{rows.map(([listen, targetPort]) => <span key={`${listen}-${targetPort}`}>{universal ? <b className="mapping-transport">TCP+UDP</b> : null}<code>{listen}</code><i className="bi bi-arrow-right" aria-hidden="true" /><code>{targetHost || '目标'}:{targetPort}</code></span>)}{source.ports.length > rows.length ? <span className="more">另有 {source.ports.length - rows.length} 组</span> : null}</div></div>;
 }
 
-function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, onSave, saving }) {
+function ServiceDiscoveryDialog({ open, loading, error, result, sourceProtocols, onClose, onRefresh, onSelect }) {
+  const compatible = (service) => {
+    const protocols = service.protocols || [];
+    return (!hasWebProtocol(sourceProtocols) || hasWebProtocol(protocols))
+      && (!sourceProtocols.includes('tcp') || protocols.includes('tcp'))
+      && (!sourceProtocols.includes('udp') || protocols.includes('udp'));
+  };
+  return <Dialog.Root open={open} onOpenChange={(value) => { if (!value && !loading) onClose(); }}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Popup className="dialog-popup discovery-dialog"><header className="dialog-header"><div><span className="section-kicker">LAN DISCOVERY</span><Dialog.Title>发现局域网目标</Dialog.Title><Dialog.Description>扫描已知设备的常用服务端口；选择后会自动回填目标地址、端口和兼容协议。</Dialog.Description></div><Dialog.Close className="dialog-close" aria-label="关闭" disabled={loading}><i className="bi bi-x-lg" aria-hidden="true" /></Dialog.Close></header><div className="dialog-body form-stack">{error ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{error}</div> : null}{loading ? <div className="discovery-loading" role="status"><i className="bi bi-radar" aria-hidden="true" /><strong>正在扫描已知设备…</strong><small>设备数量较多时可能需要数秒。</small></div> : <div className="service-discovery-list">{(result.services || []).map((service) => { const usable = compatible(service); return <button type="button" key={service.id} disabled={!usable} title={usable ? `使用 ${service.host}:${service.port}` : '当前来源协议与此服务不兼容'} onClick={() => onSelect(service)}><span className="service-discovery-icon"><i className={`bi ${service.protocols?.some((protocol) => ['http', 'https', 'ws', 'wss'].includes(protocol)) ? 'bi-window-stack' : service.protocols?.includes('udp') ? 'bi-broadcast' : 'bi-ethernet'}`} aria-hidden="true" /></span><span><strong>{service.name}</strong><code>{service.host}:{service.port}</code><small>{(service.protocols || []).map((protocol) => protocolLabels[protocol]).join(' · ')}{service.latencyMs ? ` · ${service.latencyMs} ms` : ''}</small></span><i className={`bi ${usable ? 'bi-arrow-right-circle' : 'bi-lock'}`} aria-hidden="true" /></button>; })}{!result.services?.length ? <EmptyState icon="bi-radar" title="暂未发现可用服务" description={`已检查 ${result.scannedHosts || 0} 台已知设备、${result.scannedPorts || 0} 个常用端口。可先访问目标设备或手动填写地址。`} /> : null}</div>}</div><footer className="dialog-actions"><span className="discovery-summary">{result.completedAt ? `最近扫描：${new Date(result.completedAt).toLocaleTimeString()}` : '仅扫描当前可见的已知设备'}</span><button type="button" className="secondary-button" disabled={loading} onClick={onRefresh}><i className={`bi ${loading ? 'bi-arrow-repeat' : 'bi-radar'}`} aria-hidden="true" />{loading ? '扫描中…' : '重新扫描'}</button></footer></Dialog.Popup></Dialog.Portal></Dialog.Root>;
+}
+
+function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, onSave, saving, onInspect, onImportCertificate, issuancePanel }) {
   const [tab, setTab] = useState('basic');
+  const [certificatePanel, setCertificatePanel] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [awaitingCertificate, setAwaitingCertificate] = useState(null);
+  const [certificateNotice, setCertificateNotice] = useState('');
   const [draft, setDraft] = useState(blankRule);
   const [mode, setMode] = useState('precise');
   const [errors, setErrors] = useState({});
   const [compatibilityNotice, setCompatibilityNotice] = useState('');
   const [submitError, setSubmitError] = useState('');
+  const [discoveryOpen, setDiscoveryOpen] = useState(false);
+  const [discoveryLoading, setDiscoveryLoading] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState('');
+  const [discoveryResult, setDiscoveryResult] = useState({ services: [] });
   useEffect(() => {
     if (!open) return;
     const value = rule || {};
@@ -371,9 +433,36 @@ function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, 
     const targetProtocols = rule ? ruleTargetProtocols(value) : blankRule.targetProtocols;
     const nextMode = isUniversalPair(protocols, targetProtocols) ? 'universal' : 'precise';
     setMode(nextMode);
-    setDraft({ ...blankRule, ...value, protocols, targetProtocols, listenPortsText: rule ? formatPortSpec(portsForRule(value, 'listen')) : blankRule.listenPortsText, targetPortsText: rule ? formatPortSpec(portsForRule(value, 'target')) : blankRule.targetPortsText, realIp: { ...blankRule.realIp, ...(rule?.realIp || {}) }, tls: { ...blankRule.tls, ...(rule?.tls || {}) }, domainsText: lines(rule?.domains), allowText: lines(rule?.allowIps), blockText: lines(rule?.blockIps), headersText: headersToText(rule?.customHeaders) });
+    setDraft({ ...blankRule, ...value, protocols, targetProtocols, listenPortsText: rule ? formatPortSpec(portsForRule(value, 'listen')) : blankRule.listenPortsText, targetPortsText: rule ? formatPortSpec(portsForRule(value, 'target')) : blankRule.targetPortsText, realIp: { ...blankRule.realIp, ...(rule?.realIp || {}) }, tls: { ...blankRule.tls, ...(rule?.tls || {}) }, schedule: { ...blankRule.schedule, ...(rule?.schedule || {}) }, domainsText: lines(rule?.domains), allowText: lines(rule?.allowIps), blockText: lines(rule?.blockIps), headersText: headersToText(rule?.customHeaders) });
+    setDiscoveryOpen(false); setDiscoveryError(''); setDiscoveryResult({ services: [] });
+    setCertificatePanel(null); setAwaitingCertificate(null); setCertificateNotice('');
     setTab('basic'); setErrors({}); setCompatibilityNotice(''); setSubmitError('');
   }, [open, rule]);
+  const bindCertificate = (id) => {
+    setDraft((current) => ({ ...current, tls: { ...current.tls, certId: id } }));
+    setErrors((current) => ({ ...current, certId: undefined }));
+    setCertificatePanel(null); setCertificateNotice('证书已选入此规则，保存并应用后生效。');
+  };
+  const issuance = issuancePanel?.props.integration;
+  useEffect(() => {
+    if (!open || !awaitingCertificate || !issuance) return;
+    const config = issuance[awaitingCertificate.key];
+    if (!config?.lastSuccessAt || config.lastSuccessAt === awaitingCertificate.before || !config.certificateId) return;
+    const cert = certificates.find((item) => item.id === config.certificateId);
+    if (!cert) return;
+    const currentDomains = parseLines(draft.domainsText).map((d) => d.toLowerCase()).sort().join(',');
+    const coversDomains = currentDomains.split(',').every((domain) => (cert.subjectAltNames || []).some((san) => { const name = san.toLowerCase(); return name === domain || name.startsWith('*.') && !domain.startsWith('*.') && domain.endsWith(name.slice(1)) && domain.split('.').length === name.split('.').length; }));
+    if (currentDomains !== awaitingCertificate.domains || !coversDomains || cert.automation?.environment === 'staging') {
+      setCertificateNotice('证书与当前规则域名不匹配，或签发的是测试证书，请核对后选择可用证书。'); setAwaitingCertificate(null); return;
+    }
+    bindCertificate(cert.id); setAwaitingCertificate(null);
+  }, [issuance, certificates, awaitingCertificate, open]);
+  const importCertificate = async (form) => {
+    setImportBusy(true);
+    try { const cert = await onImportCertificate(form); bindCertificate(cert.id); return true; }
+    catch (error) { return { error }; }
+    finally { setImportBusy(false); }
+  };
   const clearValidationErrors = (...keys) => setErrors((current) => {
     if (!keys.some((key) => current[key])) return current;
     const next = { ...current };
@@ -401,6 +490,7 @@ function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, 
     if (source.includes('udp') && !targets.includes('udp')) next.targetProtocols = 'UDP 入口需要 UDP 目标';
     if (!source.includes('tcp') && targets.includes('tcp') || !source.includes('udp') && targets.includes('udp') || !hasWebProtocol(source) && hasWebProtocol(targets)) next.targetProtocols = '目标协议需要与来源协议类型对应';
     if (!draft.targetHost.trim()) next.targetHost = '请输入目标主机';
+    if (draft.schedule?.enabled && !draft.schedule.days?.length) next.schedule = '计划启停至少需要选择一天';
     if (hasTlsProtocol(source) && draft.enabled && !certificatesAvailable) next.certId = '证书数据暂不可用，请先返回页面重试同步';
     else if (hasTlsProtocol(source) && draft.enabled && !draft.tls.certId) next.certId = '启用 HTTPS / WSS 规则前请选择证书';
     else if (hasTlsProtocol(source) && draft.enabled) {
@@ -416,11 +506,11 @@ function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, 
     else if (!listenResult.error && targetResult.ports.length !== 1 && targetResult.ports.length !== listenResult.ports.length) next.targetPort = `目标需填写 1 个端口，或填写 ${listenResult.ports.length} 个端口进行一一映射`;
     setErrors(next);
     if (Object.keys(next).length) {
-      const basicError = ['name', 'protocols', 'targetProtocols', 'targetHost', 'listenPort', 'targetPort'].some((key) => next[key]);
-      const targetTab = basicError ? 'basic' : next.certId || next.headers ? 'advanced' : 'security';
+      const basicError = ['name', 'protocols', 'targetProtocols', 'targetHost', 'listenPort', 'targetPort', 'certId'].some((key) => next[key]);
+      const targetTab = basicError ? 'basic' : next.headers ? 'advanced' : 'security';
       setTab(targetTab);
       const order = targetTab === 'basic'
-        ? [['name', 'rule-name'], ['protocols', 'source-protocols'], ['listenPort', 'rule-listen-ports'], ['targetProtocols', 'target-protocols'], ['targetHost', 'rule-target-host'], ['targetPort', 'rule-target-ports']]
+        ? [['name', 'rule-name'], ['protocols', 'source-protocols'], ['listenPort', 'rule-listen-ports'], ['targetProtocols', 'target-protocols'], ['targetHost', 'rule-target-host'], ['targetPort', 'rule-target-ports'], ['certId', 'rule-certificate']]
         : [['certId', 'rule-certificate'], ['headers', 'rule-custom-headers']];
       const first = order.find(([key]) => next[key]);
       window.requestAnimationFrame(() => {
@@ -459,6 +549,25 @@ function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, 
     clearValidationErrors('targetProtocols');
     setDraft((current) => ({ ...current, targetProtocols: next }));
   };
+  const scanTargets = async () => {
+    setDiscoveryOpen(true);
+    setDiscoveryLoading(true);
+    setDiscoveryError('');
+    try { setDiscoveryResult(await api('/discovery/services', { timeoutMs: 45000, idempotent: true })); }
+    catch (error) { setDiscoveryError(errorText(error, '目标扫描失败，请稍后重试')); }
+    finally { setDiscoveryLoading(false); }
+  };
+  const selectDiscoveredService = (service) => {
+    const available = service.protocols || [];
+    const nextTargets = [];
+    if (hasWebProtocol(draft.protocols)) nextTargets.push(available.find((protocol) => ['http', 'https', 'ws', 'wss'].includes(protocol)) || 'http');
+    if (draft.protocols.includes('tcp')) nextTargets.push('tcp');
+    if (draft.protocols.includes('udp')) nextTargets.push('udp');
+    setDraft((current) => ({ ...current, name: current.name || `${service.name} 转发`, targetHost: service.host, targetPortsText: String(service.port), targetProtocols: [...new Set(nextTargets)] }));
+    clearValidationErrors('targetHost', 'targetPort', 'targetProtocols');
+    setCompatibilityNotice(`已从局域网发现 ${service.name}，并按当前来源协议更新目标设置。`);
+    setDiscoveryOpen(false);
+  };
   const selectedCertificate = certificates.find((certificate) => certificate.id === draft.tls.certId);
   const selectedCertificateValidity = selectedCertificate ? certificateState(selectedCertificate) : null;
   const certificateHint = !certificatesAvailable
@@ -467,8 +576,8 @@ function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, 
       ? '原证书已不存在；可先停用保存，重新启用前需选择可用证书'
       : selectedCertificateValidity && !selectedCertificateValidity.usable
         ? `${selectedCertificateValidity.label}：${selectedCertificateValidity.message}`
-        : certificates.length ? '应用证书优先；fnOS 系统证书为实验性只读来源' : '请先到证书页面导入应用证书';
-  return <Dialog.Root open={open} onOpenChange={(value) => { if (!value && !saving) onClose(); }}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Popup className="dialog-popup rule-dialog"><form onSubmit={submit}><header className="dialog-header"><div><span className="section-kicker">{rule ? 'EDIT ROUTE' : 'NEW ROUTE'}</span><Dialog.Title>{rule ? '编辑代理规则' : '添加代理规则'}</Dialog.Title><Dialog.Description>{mode === 'universal' ? '此已有规则同时监听 TCP 与 UDP，并将内容原样转发。' : '选择入口和目标协议，再填写对应地址与端口。'}</Dialog.Description></div><Dialog.Close className="dialog-close" aria-label="关闭" disabled={saving}><i className="bi bi-x-lg" aria-hidden="true" /></Dialog.Close></header><div className="dialog-tabs">{[['basic', '常规'], ['advanced', mode === 'universal' ? '转发设置' : '请求与 TLS'], ['security', '访问控制']].map(([value, label]) => <button key={value} type="button" aria-pressed={tab === value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{label}</button>)}</div><div className="dialog-body">
+        : certificates.length ? '应用证书优先；fnOS 系统证书为实验性只读来源' : '可在下方自动申请或上传已有证书';
+  return <><Dialog.Root open={open} onOpenChange={(value) => { if (!value && !saving && !discoveryOpen) onClose(); }}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Popup className="dialog-popup rule-dialog"><form onSubmit={submit}><header className="dialog-header"><div><span className="section-kicker">{rule ? 'EDIT ROUTE' : 'NEW ROUTE'}</span><Dialog.Title>{rule ? '编辑代理规则' : '添加代理规则'}</Dialog.Title><Dialog.Description>{mode === 'universal' ? '此已有规则同时监听 TCP 与 UDP，并将内容原样转发。' : '选择入口和目标协议，再填写对应地址与端口。'}</Dialog.Description></div><Dialog.Close className="dialog-close" aria-label="关闭" disabled={saving}><i className="bi bi-x-lg" aria-hidden="true" /></Dialog.Close></header><div className="dialog-tabs">{[['basic', '常规'], ['advanced', mode === 'universal' ? '转发设置' : '请求与 TLS'], ['security', '访问与计划']].map(([value, label]) => <button key={value} type="button" aria-pressed={tab === value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{label}</button>)}</div><div className="dialog-body">
     {submitError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{submitError}</div> : null}
     {tab === 'basic' ? <div className="form-stack">
       <Field label="规则名称" required error={errors.name}><input id="rule-name" value={draft.name} onChange={(event) => set('name', event.target.value)} placeholder="例如：家庭面板" /></Field>
@@ -478,22 +587,34 @@ function RuleDialog({ open, rule, certificates, certificatesAvailable, onClose, 
         <div className="form-grid two endpoint-grid"><Field label="监听地址" hint="0.0.0.0 表示所有网卡"><input id="rule-listen-host" value={draft.listenHost} onChange={(event) => set('listenHost', event.target.value)} /></Field><PortListField label="监听端口" value={draft.listenPortsText} onChange={(value) => set('listenPortsText', value, 'listenPort')} error={errors.listenPort} hint="支持逗号、空格或换行；连续范围用短横线，最多 256 个" /></div>
         {mode === 'precise' && hasWebProtocol(draft.protocols) ? <Field label="域名" hint="每行一个；支持 *.example.com。留空允许所有域名"><textarea rows="2" value={draft.domainsText} onChange={(event) => set('domainsText', event.target.value)} placeholder="home.example.com" /></Field> : null}
       </fieldset>
+      {mode === 'precise' && hasWebProtocol(draft.protocols) ? <fieldset className="form-card rule-certificate-flow"><legend>HTTPS 与证书</legend>
+        <CheckRow checked={hasTlsProtocol(draft.protocols)} onChange={(enabled) => sourceProtocolsChanged(draft.protocols.map((p) => enabled ? ({ http: 'https', ws: 'wss' }[p] || p) : ({ https: 'http', wss: 'ws' }[p] || p)))} title="使用 HTTPS 加密访问" description="保护访客到代理入口的连接；目标服务仍可使用 HTTP。监听端口保持你的设置。" />
+        {hasTlsProtocol(draft.protocols) ? <Field label="入口证书" required={draft.enabled} error={errors.certId} hint={certificateHint}><UISelect id="rule-certificate" disabled={!certificatesAvailable} value={draft.tls.certId} onChange={(event) => { setSubmitError(''); clearValidationErrors('certId'); setDraft((current) => ({ ...current, tls: { ...current.tls, certId: event.target.value } })); }}><option value="">{certificatesAvailable ? draft.enabled ? '选择证书' : '停用规则可暂不选择' : '证书数据暂不可用'}</option>{draft.tls.certId && !selectedCertificate ? <option value={draft.tls.certId} disabled>原证书已不存在（仅保留引用）</option> : null}{certificates.some((certificate) => !isSystemCertificate(certificate)) ? <optgroup label="应用证书">{certificates.filter((certificate) => !isSystemCertificate(certificate)).map((certificate) => <option key={certificate.id} value={certificate.id} disabled={!isCertificateUsable(certificate)}>{certificateOptionLabel(certificate)}</option>)}</optgroup> : null}{certificates.some(isSystemCertificate) ? <optgroup label="fnOS 系统证书（实验性 · 只读）">{certificates.filter(isSystemCertificate).map((certificate) => <option key={certificate.id} value={certificate.id} disabled={!isCertificateUsable(certificate)}>{certificateOptionLabel(certificate)}</option>)}</optgroup> : null}</UISelect></Field> : null}
+        {hasTlsProtocol(draft.protocols) ? <><div className="automation-actions"><button type="button" className="secondary-button" disabled={!parseLines(draft.domainsText).length} onClick={() => setCertificatePanel('issue')}><i className="bi bi-shield-plus" />自动申请证书</button><button type="button" className="secondary-button" onClick={() => setCertificatePanel('import')}><i className="bi bi-upload" />上传已有证书</button></div><small>{parseLines(draft.domainsText).length ? '自动申请或上传后会选入当前规则，已有证书也可直接选择。' : '先在上方填写访问域名，再自动申请证书。'}</small></> : null}
+        {certificateNotice ? <p role="status">{certificateNotice}</p> : null}
+        {hasTlsProtocol(draft.protocols) && parseLines(draft.domainsText).length ? <p className="rule-access-preview">保存后的访问地址：<code>https://{parseLines(draft.domainsText)[0]}:{parsePortInput(draft.listenPortsText).ports?.[0] || '端口'}</code></p> : null}
+      </fieldset> : null}
       <ProtocolFlow source={draft.protocols} targets={draft.targetProtocols} universal={mode === 'universal'} />
       {compatibilityNotice ? <div className="compatibility-notice" role="status"><i className="bi bi-info-circle" aria-hidden="true" />{compatibilityNotice}</div> : null}
       <fieldset className="form-card"><legend>目标设置</legend>
+        <div className="target-discovery-row"><span><i className="bi bi-radar" aria-hidden="true" />从局域网已知设备中查找目标服务</span><button type="button" className="secondary-button" onClick={() => void scanTargets()}><i className="bi bi-search" aria-hidden="true" />发现目标</button></div>
         {mode === 'precise' ? <ProtocolPicker id="target-protocols" label="目标协议（同组可多选）" options={targetProtocolOptions} value={draft.targetProtocols} onChange={targetProtocolsChanged} error={errors.targetProtocols} disabledReasons={targetDisabledReasons(draft.protocols, draft.targetProtocols)} helper="目标必须与来源类型对应；灰色锁定项会直接显示不可选原因。来源变化时，必要的目标协议会自动同步。" /> : null}
         <div className="form-grid two endpoint-grid"><Field label="主机名 / IP" required error={errors.targetHost}><input id="rule-target-host" value={draft.targetHost} onChange={(event) => set('targetHost', event.target.value)} placeholder="192.168.1.10" /></Field><PortListField label="目标端口" value={draft.targetPortsText} onChange={(value) => set('targetPortsText', value, 'targetPort')} error={errors.targetPort} hint="填 1 个端口会被全部入口复用；与来源等量时按顺序映射" /></div>
         <PortMappingPreview sourceText={draft.listenPortsText} targetText={draft.targetPortsText} targetHost={draft.targetHost} universal={mode === 'universal'} />
       </fieldset>
       <CheckRow checked={draft.enabled} onChange={(value) => set('enabled', value, 'certId')} title="保存后立即启用" description="系统会先校验协议组合与全部端口，失败时保留规则并显示原因。" />
     </div> : null}
-    {tab === 'advanced' ? mode === 'universal' ? <div className="form-stack"><UniversalForwardingNote compact /><div className="universal-timeout"><Field label="连接超时（毫秒）" hint="推荐 30000；空闲连接超过此时间会关闭"><input type="number" min="1000" max="300000" step="1000" value={draft.timeoutMs} onChange={(event) => set('timeoutMs', event.target.value)} /></Field></div></div> : <div className="form-stack"><div className="form-grid two"><Field label="代理超时（毫秒）" hint="推荐 30000"><input type="number" min="1000" max="300000" step="1000" value={draft.timeoutMs} onChange={(event) => set('timeoutMs', event.target.value)} /></Field><Field label="上传限制（MB）" hint="0 表示不限制"><input type="number" min="0" max="10240" value={draft.uploadLimitMb} onChange={(event) => set('uploadLimitMb', event.target.value)} /></Field></div>{hasTlsProtocol(draft.protocols) ? <Field label="入口证书" required={draft.enabled} error={errors.certId} hint={certificateHint}><select id="rule-certificate" disabled={!certificatesAvailable} value={draft.tls.certId} onChange={(event) => { setSubmitError(''); clearValidationErrors('certId'); setDraft((current) => ({ ...current, tls: { ...current.tls, certId: event.target.value } })); }}><option value="">{certificatesAvailable ? draft.enabled ? '选择证书' : '停用规则可暂不选择' : '证书数据暂不可用'}</option>{draft.tls.certId && !selectedCertificate ? <option value={draft.tls.certId} disabled>原证书已不存在（仅保留引用）</option> : null}{certificates.some((certificate) => !isSystemCertificate(certificate)) ? <optgroup label="应用证书">{certificates.filter((certificate) => !isSystemCertificate(certificate)).map((certificate) => <option key={certificate.id} value={certificate.id} disabled={!isCertificateUsable(certificate)}>{certificateOptionLabel(certificate)}</option>)}</optgroup> : null}{certificates.some(isSystemCertificate) ? <optgroup label="fnOS 系统证书（实验性 · 只读）">{certificates.filter(isSystemCertificate).map((certificate) => <option key={certificate.id} value={certificate.id} disabled={!isCertificateUsable(certificate)}>{certificateOptionLabel(certificate)}</option>)}</optgroup> : null}</select></Field> : null}<Field label="自定义请求头" error={errors.headers} hint="每行一个，格式：名称: 值"><textarea id="rule-custom-headers" rows="5" value={draft.headersText} onChange={(event) => set('headersText', event.target.value, 'headers')} placeholder={'X-Proxy-By: fnOS\nX-Forwarded-Proto: https'} /></Field><div className="check-grid"><CheckRow checked={draft.preserveHost} onChange={(value) => set('preserveHost', value)} title="保留原始 Host" description="目标服务依赖访问域名时启用。" /><CheckRow checked={draft.forceHttps} disabled={!draft.protocols.some((protocol) => ['http', 'ws'].includes(protocol))} onChange={(value) => set('forceHttps', value)} title="强制跳转 HTTPS" description="仅 HTTP / WebSocket 入口可用，返回 308 跳转。" /><CheckRow checked={draft.hsts} disabled={!hasTlsProtocol(draft.protocols)} onChange={(value) => set('hsts', value)} title="启用 HSTS" description="仅 HTTPS / WSS 入口可用。" /><CheckRow checked={draft.rejectUnauthorized} disabled={!draft.targetProtocols.some((protocol) => ['https', 'wss'].includes(protocol))} onChange={(value) => set('rejectUnauthorized', value)} title="校验目标证书" description="目标使用自签名证书时可关闭。" /></div></div> : null}
-    {tab === 'security' ? <div className="form-stack"><div className="access-note"><i className="bi bi-shield-check" aria-hidden="true" /><span>黑名单优先于白名单；白名单留空时允许所有来源。支持单个 IP 和 CIDR 网段。</span></div><div className="form-grid two"><Field label="白名单（Allow IPs）" hint="每行一个，例如 192.168.1.0/24"><textarea rows="7" value={draft.allowText} onChange={(event) => set('allowText', event.target.value)} placeholder="留空允许所有" /></Field><Field label="黑名单（Block IPs）" hint="黑名单始终优先"><textarea rows="7" value={draft.blockText} onChange={(event) => set('blockText', event.target.value)} placeholder="例如 10.0.0.8" /></Field></div>{mode === 'precise' ? <><CheckRow checked={draft.realIp.enabled} onChange={(value) => setDraft((current) => ({ ...current, realIp: { ...current.realIp, enabled: value } }))} title="传递真实客户端 IP" description="自动添加 X-Forwarded-For 等转发头。" />{draft.realIp.enabled ? <Field label="真实 IP 请求头"><input value={draft.realIp.header} onChange={(event) => setDraft((current) => ({ ...current, realIp: { ...current.realIp, header: event.target.value } }))} /></Field> : null}</> : null}</div> : null}
-  </div><footer className="dialog-actions"><Dialog.Close className="secondary-button" disabled={saving}>取消</Dialog.Close><button type="submit" className="primary-button" disabled={saving}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{saving ? '正在保存…' : '保存并应用'}</button></footer></form></Dialog.Popup></Dialog.Portal></Dialog.Root>;
+    {tab === 'advanced' ? mode === 'universal' ? <div className="form-stack"><UniversalForwardingNote compact /><div className="universal-timeout"><Field label="连接超时（毫秒）" hint="推荐 30000；空闲连接超过此时间会关闭"><input type="number" min="1000" max="300000" step="1000" value={draft.timeoutMs} onChange={(event) => set('timeoutMs', event.target.value)} /></Field></div></div> : <div className="form-stack"><div className="form-grid two"><Field label="代理超时（毫秒）" hint="推荐 30000"><input type="number" min="1000" max="300000" step="1000" value={draft.timeoutMs} onChange={(event) => set('timeoutMs', event.target.value)} /></Field><Field label="上传限制（MB）" hint="0 表示不限制"><input type="number" min="0" max="10240" value={draft.uploadLimitMb} onChange={(event) => set('uploadLimitMb', event.target.value)} /></Field></div><Field label="自定义请求头" error={errors.headers} hint="每行一个，格式：名称: 值"><textarea id="rule-custom-headers" rows="5" value={draft.headersText} onChange={(event) => set('headersText', event.target.value, 'headers')} placeholder={'X-Proxy-By: fnOS\nX-Forwarded-Proto: https'} /></Field><div className="check-grid"><CheckRow checked={draft.preserveHost} onChange={(value) => set('preserveHost', value)} title="保留原始 Host" description="目标服务依赖访问域名时启用。" /><CheckRow checked={draft.forceHttps} disabled={!draft.protocols.some((protocol) => ['http', 'ws'].includes(protocol))} onChange={(value) => set('forceHttps', value)} title="强制跳转 HTTPS" description="仅 HTTP / WebSocket 入口可用，返回 308 跳转。" /><CheckRow checked={draft.hsts} disabled={!hasTlsProtocol(draft.protocols)} onChange={(value) => set('hsts', value)} title="启用 HSTS" description="仅 HTTPS / WSS 入口可用。" /><CheckRow checked={draft.rejectUnauthorized} disabled={!draft.targetProtocols.some((protocol) => ['https', 'wss'].includes(protocol))} onChange={(value) => set('rejectUnauthorized', value)} title="校验目标证书" description="目标使用自签名证书时可关闭。" /></div></div> : null}
+    {tab === 'security' ? <div className="form-stack"><div className="access-note"><i className="bi bi-shield-check" aria-hidden="true" /><span>黑名单优先于白名单；白名单留空时允许所有来源。支持单个 IP 和 CIDR 网段。</span></div><div className="form-grid two"><Field label="白名单（Allow IPs）" hint="每行一个，例如 192.168.1.0/24"><textarea rows="7" value={draft.allowText} onChange={(event) => set('allowText', event.target.value)} placeholder="留空允许所有" /></Field><Field label="黑名单（Block IPs）" hint="黑名单始终优先"><textarea rows="7" value={draft.blockText} onChange={(event) => set('blockText', event.target.value)} placeholder="例如 10.0.0.8" /></Field></div>{mode === 'precise' ? <><CheckRow checked={draft.realIp.enabled} onChange={(value) => setDraft((current) => ({ ...current, realIp: { ...current.realIp, enabled: value } }))} title="传递真实客户端 IP" description="自动添加 X-Forwarded-For 等转发头。" />{draft.realIp.enabled ? <Field label="真实 IP 请求头"><input value={draft.realIp.header} onChange={(event) => setDraft((current) => ({ ...current, realIp: { ...current.realIp, header: event.target.value } }))} /></Field> : null}</> : null}<fieldset className="form-card schedule-card"><legend>计划启停</legend><CheckRow checked={draft.schedule.enabled} onChange={(value) => { clearValidationErrors('schedule'); setDraft((current) => ({ ...current, schedule: { ...current.schedule, enabled: value } })); }} title="按时段开放规则" description="监听保持就绪；计划外请求会被立即拒绝，不会转发到目标。" />{draft.schedule.enabled ? <><div className="weekday-picker" aria-label="运行日期">{weekdayLabels.map(([value, label]) => { const day = Number(value); const active = draft.schedule.days.includes(day); return <button type="button" key={value} className={active ? 'selected' : ''} aria-pressed={active} onClick={() => { clearValidationErrors('schedule'); setDraft((current) => ({ ...current, schedule: { ...current.schedule, days: active ? current.schedule.days.filter((item) => item !== day) : [...current.schedule.days, day].sort((a, b) => a - b) } })); }}>{label}</button>; })}</div>{errors.schedule ? <em className="schedule-error" role="alert">{errors.schedule}</em> : null}<div className="form-grid two"><Field label="开始时间"><input type="time" value={draft.schedule.start} onChange={(event) => setDraft((current) => ({ ...current, schedule: { ...current.schedule, start: event.target.value } }))} /></Field><Field label="结束时间" hint="结束早于开始时视为跨天"><input type="time" value={draft.schedule.end} onChange={(event) => setDraft((current) => ({ ...current, schedule: { ...current.schedule, end: event.target.value } }))} /></Field></div></> : null}</fieldset></div> : null}
+  </div><footer className="dialog-actions"><Dialog.Close className="secondary-button" disabled={saving}>取消</Dialog.Close><button type="submit" className="primary-button" disabled={saving}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{saving ? '正在保存…' : '保存并应用'}</button></footer></form></Dialog.Popup></Dialog.Portal></Dialog.Root>
+    <CertificateDialog open={certificatePanel === 'import'} single saving={importBusy} onClose={() => setCertificatePanel(null)} onInspect={onInspect} onSave={importCertificate} />
+    <Dialog.Root open={certificatePanel === 'issue'} onOpenChange={(value) => { if (!value) setCertificatePanel(null); }}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Popup className="dialog-popup rule-issuance-dialog"><header className="dialog-header"><div><Dialog.Title>为当前规则申请证书</Dialog.Title><Dialog.Description>规则内容会保留。申请成功后自动选入，保存规则后生效。</Dialog.Description></div><Dialog.Close className="dialog-close" aria-label="返回规则"><i className="bi bi-x-lg" /></Dialog.Close></header><div className="dialog-body">{issuancePanel ? cloneElement(issuancePanel, { expectedDomains: parseLines(draft.domainsText), onCertificates: () => setCertificatePanel(null), onIssue: () => { const key = issuance.provider === 'acme' ? 'acme' : 'aliyun'; setAwaitingCertificate({ key, before: issuance[key]?.lastSuccessAt, domains: parseLines(draft.domainsText).map((d) => d.toLowerCase()).sort().join(',') }); issuancePanel.props.onIssue(); } }) : null}</div></Dialog.Popup></Dialog.Portal></Dialog.Root>
+    <ServiceDiscoveryDialog open={discoveryOpen} loading={discoveryLoading} error={discoveryError} result={discoveryResult} sourceProtocols={draft.protocols} onClose={() => setDiscoveryOpen(false)} onRefresh={() => void scanTargets()} onSelect={selectDiscoveredService} /></>;
 }
 
-function CertificateRow({ certificate, rules, rulesAvailable, onDelete }) {
+function CertificateRow({ certificate, rules, rulesAvailable, onDelete, onReplace }) {
   const systemManaged = isSystemCertificate(certificate);
+  const applicationSource = certificate.automation?.provider === 'aliyun-free' ? '阿里云免费' : certificate.automation?.provider === 'acme' ? certificate.automation.environment === 'staging' ? 'ACME 测试' : 'ACME 自动' : certificate.automation?.provider === 'push' ? '外部推送' : '应用';
   const used = rulesAvailable ? rules.filter((rule) => rule.tls?.certId === certificate.id) : null;
   const currentValidity = certificateState(certificate);
   const validity = certificate.stale && currentValidity.usable
@@ -513,7 +634,7 @@ function CertificateRow({ certificate, rules, rulesAvailable, onDelete }) {
   return <article className={`certificate-row${systemManaged ? ' system-managed' : ''}${currentValidity.usable ? '' : ' unavailable'}`}>
     <span className="certificate-icon"><i className={`bi ${systemManaged ? 'bi-hdd-network' : 'bi-shield-lock'}`} aria-hidden="true" /></span>
     <div className="certificate-primary">
-      <div><h3>{certificate.name}</h3><StatusChip state={validity.state} label={validity.label} message={validity.message} /><span className={`certificate-source-badge ${systemManaged ? 'system' : 'manual'}`}>{systemManaged ? '系统托管' : '应用'}</span></div>
+      <div><h3>{certificate.name}</h3><StatusChip state={validity.state} label={validity.label} message={validity.message} /><span className={`certificate-source-badge ${systemManaged ? 'system' : 'manual'}`}>{systemManaged ? '系统托管' : applicationSource}</span></div>
       <p title={certificate.subjectAltNames?.join(', ') || certificate.subject}>{certificate.subjectAltNames?.join('、') || certificate.domains?.join('、') || certificate.subject || '未读取到证书主体'}</p>
       <span>{certificate.format || (systemManaged ? 'SYSTEM' : 'PEM')} · {(certificate.keyType || 'key').toUpperCase()}{certificate.chainLength > 1 ? ` · ${certificate.chainLength} 级证书链` : ''}</span>
     </div>
@@ -521,11 +642,25 @@ function CertificateRow({ certificate, rules, rulesAvailable, onDelete }) {
       <div><dt>有效期</dt><dd>{formatCertificateDate(certificate.validFrom)} – {formatCertificateDate(certificate.validTo)}</dd></div>
       <div><dt>{systemManaged ? '系统状态' : '使用规则'}</dt><dd title={systemManaged ? certificate.lastError || systemState : undefined}>{systemManaged ? systemState : !rulesAvailable ? '无法确认' : used.length ? used.map((rule) => rule.name).join('、') : '未使用'}</dd></div>
     </dl>
-    {systemManaged ? <span className="certificate-readonly" title="由 fnOS 管理，不能在这里删除、替换或导出"><i className="bi bi-lock" aria-hidden="true" />只读</span> : <button type="button" className="row-action danger" disabled={Boolean(deleteBlockedReason)} aria-label={`删除证书 ${certificate.name}`} title={deleteBlockedReason || '删除证书'} onClick={() => onDelete(certificate)}><i className="bi bi-trash3" aria-hidden="true" /></button>}
+    {systemManaged ? <span className="certificate-readonly" title="由 fnOS 管理，不能在这里删除、替换或导出"><i className="bi bi-lock" aria-hidden="true" />只读</span> : <><button type="button" className="secondary-button" disabled={!rulesAvailable} onClick={() => onReplace(certificate)}>替换并应用</button><button type="button" className="row-action danger" disabled={Boolean(deleteBlockedReason)} aria-label={`删除证书 ${certificate.name}`} title={deleteBlockedReason || '删除证书'} onClick={() => onDelete(certificate)}><i className="bi bi-trash3" aria-hidden="true" /></button></>}
   </article>;
 }
 
-function CertificatesPage({ certificates, systemSource, rules, rulesAvailable, systemReloading, onCreate, onDelete, onReloadSystem }) {
+function CertificatePushCard({ integration, busy, onRotate, onDisable }) {
+  const [revealed, setRevealed] = useState(null);
+  const status = integration || { enabled: false };
+  const endpoint = status.bindingId ? new URL(apiUrl(`/integrations/certificates/${status.bindingId}`), location.origin).toString() : '';
+  const rotate = async () => {
+    if (status.enabled && !window.confirm('重新生成后，旧推送令牌会立即失效。确定继续吗？')) return;
+    const result = await onRotate();
+    if (result?.token) setRevealed({ endpoint: new URL(apiUrl(`/integrations/certificates/${result.bindingId}`), location.origin).toString(), token: result.token });
+  };
+  const copy = async (value) => { try { await navigator.clipboard.writeText(value); } catch { window.prompt('请复制以下内容', value); } };
+  return <article className="matte-surface certificate-surface certificate-push-card"><div className="section-heading"><div><div className="certificate-title-line"><h2>自动证书推送</h2><span className="experimental-badge">CERTD 兼容</span></div><p>为外部证书任务生成独立凭据；同一组域名会原位替换并热更新正在运行的 HTTPS / WSS。</p></div><StatusChip state={status.enabled ? 'healthy' : 'disabled'} label={status.enabled ? '已启用' : '未启用'} /></div>{status.enabled ? <div className="certificate-push-status"><div><small>推送地址</small><code>{endpoint}</code></div><div><small>最近接收</small><strong>{status.lastUsedAt ? new Date(status.lastUsedAt).toLocaleString() : '尚未接收推送'}</strong></div></div> : <div className="certificate-push-empty"><i className="bi bi-cloud-arrow-down" aria-hidden="true" /><span><strong>外部推送默认关闭</strong><small>启用后令牌只显示一次，配置到证书任务的 Bearer Token 中。</small></span></div>}{revealed ? <aside className="credential-reveal" role="status"><div><strong>请立即保存凭据</strong><small>离开此页面后令牌不会再次显示；重新生成会使旧令牌失效。</small></div><label><span>推送地址</span><code>{revealed.endpoint}</code><button type="button" className="icon-button" aria-label="复制推送地址" onClick={() => void copy(revealed.endpoint)}><i className="bi bi-copy" aria-hidden="true" /></button></label><label><span>Bearer Token</span><code>{revealed.token}</code><button type="button" className="icon-button" aria-label="复制令牌" onClick={() => void copy(revealed.token)}><i className="bi bi-copy" aria-hidden="true" /></button></label></aside> : null}<div className="certificate-push-actions"><button type="button" className="primary-button" disabled={busy} onClick={() => void rotate()}><i className={`bi ${busy ? 'bi-arrow-repeat' : status.enabled ? 'bi-arrow-clockwise' : 'bi-link-45deg'}`} aria-hidden="true" />{busy ? '处理中…' : status.enabled ? '重新生成凭据' : '启用并生成凭据'}</button>{status.enabled ? <button type="button" className="danger-button" disabled={busy} onClick={() => { if (window.confirm('确定停用外部证书推送吗？现有令牌将立即失效。')) { setRevealed(null); void onDisable(); } }}><i className="bi bi-link-45deg" aria-hidden="true" />停用推送</button> : null}</div></article>;
+}
+
+
+function CertificatesPage({ certificates, systemSource, certificatePush, rules, rulesAvailable, systemReloading, pushBusy, onCreate, onDelete, onReplace, onReloadSystem, onRotatePush, onDisablePush }) {
   const applicationCertificates = certificates.filter((certificate) => !isSystemCertificate(certificate));
   const systemCertificates = certificates.filter(isSystemCertificate);
   const reportedSourceState = systemSource?.state;
@@ -533,7 +668,7 @@ function CertificatesPage({ certificates, systemSource, rules, rulesAvailable, s
     ? reportedSourceState
     : systemSource?.available ? 'ready' : 'unavailable';
   const sourceChipState = sourceState === 'ready' ? 'healthy' : sourceState === 'degraded' ? 'warning' : 'disabled';
-  const sourceLabel = sourceState === 'ready' ? '读取正常' : sourceState === 'degraded' ? '正在回退' : '暂不可用';
+  const sourceLabel = systemReloading ? '正在读取' : sourceState === 'ready' ? '读取正常' : sourceState === 'degraded' ? (systemSource?.usingLastKnownGood ? '使用已验证副本' : '部分证书异常') : '暂不可用';
   const sourceMessage = systemSource?.message || (sourceState === 'unavailable'
     ? '当前环境未提供可读取的 fnOS 系统证书；应用证书仍可正常使用。'
     : '正在继续使用上一份已通过校验的系统证书。');
@@ -544,22 +679,26 @@ function CertificatesPage({ certificates, systemSource, rules, rulesAvailable, s
   return <section className="view certificate-groups" aria-label="证书">
     <article className="matte-surface certificate-surface">
       <div className="section-heading"><div><h2>应用证书</h2><p>由本应用终止 HTTPS / WSS 时使用；支持 PEM、CRT、PFX 与 P12 等常见格式。</p></div><button type="button" className="primary-button" onClick={onCreate}><i className="bi bi-upload" aria-hidden="true" />导入证书</button></div>
-      <div className="certificate-list">{applicationCertificates.map((certificate) => <CertificateRow key={certificate.id} certificate={certificate} rules={rules} rulesAvailable={rulesAvailable} onDelete={onDelete} />)}{!applicationCertificates.length ? <EmptyState icon="bi-shield-lock" title="还没有应用证书" description="一次选择证书链和私钥，或直接导入带密码的 PFX / P12。" action="导入证书" onAction={onCreate} /> : null}</div>
+      <div className="certificate-list">{applicationCertificates.map((certificate) => <CertificateRow key={certificate.id} certificate={certificate} rules={rules} rulesAvailable={rulesAvailable} onDelete={onDelete} onReplace={onReplace} />)}{!applicationCertificates.length ? <EmptyState icon="bi-shield-lock" title="还没有应用证书" description="一次选择证书链和私钥，或直接导入带密码的 PFX / P12。" action="导入证书" onAction={onCreate} /> : null}</div>
     </article>
+
+    <details className="certificate-advanced"><summary>高级证书来源 · 外部推送与 fnOS 只读证书</summary>
+    <CertificatePushCard integration={certificatePush} busy={pushBusy} onRotate={onRotatePush} onDisable={onDisablePush} />
+
 
     <article className="matte-surface certificate-surface system-certificate-surface">
       <div className="section-heading certificate-group-heading"><div><div className="certificate-title-line"><h2>fnOS 系统证书</h2><span className="experimental-badge">实验性</span><span className="readonly-badge">只读</span></div><p>直接复用 fnOS 已配置的 HTTPS / WSS 证书。</p></div><button type="button" className="secondary-button" disabled={systemReloading} onClick={onReloadSystem}><i className={`bi ${systemReloading ? 'bi-arrow-repeat' : 'bi-arrow-clockwise'}`} aria-hidden="true" />{systemReloading ? '正在读取…' : '重新读取'}</button></div>
       <aside className={`system-source-notice ${sourceState}`} role="status" aria-live="polite">
         <i className={`bi ${sourceState === 'ready' ? 'bi-check-circle' : sourceState === 'degraded' ? 'bi-exclamation-triangle' : 'bi-info-circle'}`} aria-hidden="true" />
-        <div><span><StatusChip state={sourceChipState} label={sourceLabel} message={sourceMessage} />{Number.isFinite(lastSuccessAt) ? <small>上次成功读取 {new Date(lastSuccessAt).toLocaleString()}</small> : null}</span><p>{sourceMessage}{sourceError && !sourceMessage.includes(sourceError) ? ` ${sourceError}` : ''}</p></div>
+        <div><span><StatusChip state={sourceChipState} label={sourceLabel} message={sourceMessage} />{Number.isFinite(lastSuccessAt) ? <small>上次成功读取 {new Date(lastSuccessAt).toLocaleString()}</small> : null}</span><p>{sourceMessage}</p>{systemSource?.errors?.length ? <details><summary>查看异常证书（{systemSource.errors.length}）</summary>{systemSource.errors.map((entry, index) => <p key={index}>{typeof entry === 'string' ? entry : `${entry.certificate || '系统证书'}：${entry.message}`}</p>)}</details> : sourceError ? <p>{sourceError}</p> : null}</div>
       </aside>
-      <div className="certificate-list">{systemCertificates.map((certificate) => <CertificateRow key={certificate.id} certificate={certificate} rules={rules} rulesAvailable={rulesAvailable} onDelete={onDelete} />)}{!systemCertificates.length ? <EmptyState icon="bi-hdd-network" title={sourceState === 'unavailable' ? '暂时无法读取系统证书' : 'fnOS 暂无可用系统证书'} description={sourceState === 'unavailable' ? '可继续导入应用证书，或在规则中使用 TLS 透传。' : '在 fnOS 中配置证书后，点击“重新读取”同步到这里。'} /> : null}</div>
+      <div className="certificate-list">{systemCertificates.map((certificate) => <CertificateRow key={certificate.id} certificate={certificate} rules={rules} rulesAvailable={rulesAvailable} onDelete={onDelete} onReplace={onReplace} />)}{!systemCertificates.length ? <EmptyState icon="bi-hdd-network" title={sourceState === 'unavailable' ? '暂时无法读取系统证书' : 'fnOS 暂无可用系统证书'} description={sourceState === 'unavailable' ? '可继续导入应用证书，或在规则中使用 TLS 透传。' : '在 fnOS 中配置证书后，点击“重新读取”同步到这里。'} /> : null}</div>
     </article>
-
+    </details>
   </section>;
 }
 
-function CertificateDialog({ open, onClose, onInspect, onSave, saving }) {
+function CertificateDialog({ open, onClose, onInspect, onSave, saving, replacement, affectedRules = [], single = false }) {
   const [mode, setMode] = useState('files');
   const [form, setForm] = useState({ name: '', certificate: '', privateKey: '', passphrase: '', files: [] });
   const [selectedFiles, setSelectedFiles] = useState([]);
@@ -599,60 +738,93 @@ function CertificateDialog({ open, onClose, onInspect, onSave, saving }) {
     event.preventDefault();
     setLocalError('');
     if (mode === 'files' && (!previews.length || !form.files.length)) { setLocalError('请先选择文件并完成解析'); return; }
+    if ((single || replacement) && mode === 'files' && previews.length !== 1) { setLocalError('请选择一套证书及其私钥'); return; }
     const saved = await onSave(mode === 'files' ? { kind: 'files', files: form.files, passphrase: form.passphrase, name: form.name } : { kind: 'paste', name: form.name, certificate: form.certificate, privateKey: form.privateKey });
     if (saved !== true) setLocalError(`${errorText(saved?.error, '导入未完成，请检查证书、私钥或密码')}。当前内容已保留。`);
   };
-  return <Dialog.Root open={open} onOpenChange={(value) => { if (!value && !saving) onClose(); }}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Popup className="dialog-popup certificate-dialog"><form onSubmit={submit}><header className="dialog-header"><div><span className="section-kicker">IMPORT CERTIFICATE</span><Dialog.Title>导入 HTTPS 证书</Dialog.Title><Dialog.Description>支持多文件、证书链和 PKCS#12，导入前会自动解析并校验私钥。</Dialog.Description></div><Dialog.Close className="dialog-close" aria-label="关闭" disabled={saving}><i className="bi bi-x-lg" aria-hidden="true" /></Dialog.Close></header><div className="dialog-tabs certificate-tabs">{[['files', '文件导入'], ['paste', '粘贴 PEM']].map(([value, label]) => <button key={value} type="button" aria-pressed={mode === value} className={mode === value ? 'active' : ''} onClick={() => { inspectRequest.current += 1; setInspecting(false); setMode(value); setForm((current) => ({ ...current, files: [] })); setPreviews([]); setWarnings([]); setLocalError(''); }}>{label}</button>)}</div><div className="dialog-body form-stack">{mode === 'files' ? <><Field label="证书名称" hint="可选；留空时自动读取域名或文件名"><input value={form.name} onChange={(event) => updateInspectionInput('name', event.target.value, '名称已更改，请重新解析')} placeholder="例如：家庭域名证书" /></Field><label className={`certificate-dropzone${inspecting ? ' busy' : ''}`}><input type="file" multiple accept=".pem,.crt,.cer,.key,.der,.pfx,.p12,application/x-pkcs12" onChange={(event) => { chooseFiles(event.target.files); event.target.value = ''; }} /><span className="dropzone-icon"><i className={`bi ${inspecting ? 'bi-arrow-repeat' : 'bi-cloud-arrow-up'}`} aria-hidden="true" /></span><strong>{inspecting ? '正在识别证书与私钥…' : '选择证书文件'}</strong><small>可多选 PEM / CRT / CER / KEY / DER，或直接选择 PFX / P12</small></label>{selectedFiles.length ? <div className="selected-file-list">{selectedFiles.map((file) => <span key={`${file.name}-${file.size}`}><i className="bi bi-file-earmark-lock" aria-hidden="true" /><b>{file.name}</b><small>{Math.max(1, Math.round(file.size / 1024))} KB</small></span>)}</div> : null}{selectedFiles.length ? <div className="pfx-passphrase"><Field label="文件密码" hint="用于 PFX、P12 或加密私钥；无密码时留空"><input type="password" value={form.passphrase} onChange={(event) => updateInspectionInput('passphrase', event.target.value, '密码已更改，请重新解析')} /></Field><button type="button" className="secondary-button" disabled={inspecting} onClick={() => void inspectFiles()}><i className="bi bi-arrow-clockwise" aria-hidden="true" />重新解析</button></div> : null}{previews.length ? <div className="certificate-preview-list"><div className="preview-heading"><strong>解析成功 · {previews.length} 张证书</strong><span>保存前请确认域名和有效期</span></div>{previews.map((certificate) => <article key={certificate.id}><span className="preview-check"><i className="bi bi-check-lg" aria-hidden="true" /></span><div><strong>{certificate.name}</strong><small>{certificate.subjectAltNames?.join('、') || certificate.subject}</small><span>{certificate.format} · {(certificate.keyType || '').toUpperCase()} · {certificate.chainLength} 级证书链</span></div><time>{new Date(certificate.validTo).toLocaleDateString()} 到期</time></article>)}</div> : null}{warnings.length ? <div className="import-warnings"><i className="bi bi-exclamation-triangle" aria-hidden="true" /><span>{warnings.join('；')}</span></div> : null}</> : <><Field label="证书名称" required><input required value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="例如：home.example.com" /></Field><Field label="证书与证书链（PEM）" required><textarea className="mono-input" required rows="7" value={form.certificate} onChange={(event) => setForm((current) => ({ ...current, certificate: event.target.value }))} placeholder="-----BEGIN CERTIFICATE-----" /></Field><Field label="私钥（PEM）" required><textarea className="mono-input" required rows="7" value={form.privateKey} onChange={(event) => setForm((current) => ({ ...current, privateKey: event.target.value }))} placeholder="-----BEGIN PRIVATE KEY-----" /></Field></>}{localError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{localError}</div> : null}</div><footer className="dialog-actions"><Dialog.Close className="secondary-button" disabled={saving}>取消</Dialog.Close><button className="primary-button" disabled={saving || inspecting || mode === 'files' && !previews.length}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-shield-check'}`} aria-hidden="true" />{saving ? '正在导入…' : mode === 'files' ? previews.length ? `导入 ${previews.length} 张证书` : '导入证书' : '校验并保存'}</button></footer></form></Dialog.Popup></Dialog.Portal></Dialog.Root>;
+  return <Dialog.Root open={open} onOpenChange={(value) => { if (!value && !saving) onClose(); }}><Dialog.Portal><Dialog.Backdrop className="dialog-backdrop" /><Dialog.Popup className="dialog-popup certificate-dialog"><form onSubmit={submit}><header className="dialog-header"><div><span className="section-kicker">IMPORT CERTIFICATE</span><Dialog.Title>{replacement ? `替换证书 · ${replacement.name}` : '导入 HTTPS 证书'}</Dialog.Title><Dialog.Description>支持多文件、证书链和 PKCS#12，导入前会自动解析并校验私钥。</Dialog.Description></div><Dialog.Close className="dialog-close" aria-label="关闭" disabled={saving}><i className="bi bi-x-lg" aria-hidden="true" /></Dialog.Close></header><div className="dialog-tabs certificate-tabs">{[['files', '文件导入'], ['paste', '粘贴 PEM']].map(([value, label]) => <button key={value} type="button" aria-pressed={mode === value} className={mode === value ? 'active' : ''} onClick={() => { inspectRequest.current += 1; setInspecting(false); setMode(value); setForm((current) => ({ ...current, files: [] })); setPreviews([]); setWarnings([]); setLocalError(''); }}>{label}</button>)}</div><div className="dialog-body form-stack">{replacement ? <aside className="automation-notice"><span>将更新：{affectedRules.length ? affectedRules.map((r) => r.name).join('、') : '暂无绑定规则'}。新证书须覆盖原域名；验证失败保留旧证书，自动轮换设置保持不变。</span></aside> : null}{mode === 'files' ? <><Field label="证书名称" hint="可选；留空时自动读取域名或文件名"><input value={form.name} onChange={(event) => updateInspectionInput('name', event.target.value, '名称已更改，请重新解析')} placeholder="例如：家庭域名证书" /></Field><label className={`certificate-dropzone${inspecting ? ' busy' : ''}`}><input type="file" multiple accept=".pem,.crt,.cer,.key,.der,.pfx,.p12,application/x-pkcs12" onChange={(event) => { chooseFiles(event.target.files); event.target.value = ''; }} /><span className="dropzone-icon"><i className={`bi ${inspecting ? 'bi-arrow-repeat' : 'bi-cloud-arrow-up'}`} aria-hidden="true" /></span><strong>{inspecting ? '正在识别证书与私钥…' : '选择证书文件'}</strong><small>可多选 PEM / CRT / CER / KEY / DER，或直接选择 PFX / P12</small></label>{selectedFiles.length ? <div className="selected-file-list">{selectedFiles.map((file) => <span key={`${file.name}-${file.size}`}><i className="bi bi-file-earmark-lock" aria-hidden="true" /><b>{file.name}</b><small>{Math.max(1, Math.round(file.size / 1024))} KB</small></span>)}</div> : null}{selectedFiles.length ? <div className="pfx-passphrase"><Field label="文件密码" hint="用于 PFX、P12 或加密私钥；无密码时留空"><input type="password" value={form.passphrase} onChange={(event) => updateInspectionInput('passphrase', event.target.value, '密码已更改，请重新解析')} /></Field><button type="button" className="secondary-button" disabled={inspecting} onClick={() => void inspectFiles()}><i className="bi bi-arrow-clockwise" aria-hidden="true" />重新解析</button></div> : null}{previews.length ? <div className="certificate-preview-list"><div className="preview-heading"><strong>解析成功 · {previews.length} 张证书</strong><span>保存前请确认域名和有效期</span></div>{previews.map((certificate) => <article key={certificate.id}><span className="preview-check"><i className="bi bi-check-lg" aria-hidden="true" /></span><div><strong>{certificate.name}</strong><small>{certificate.subjectAltNames?.join('、') || certificate.subject}</small><span>{certificate.format} · {(certificate.keyType || '').toUpperCase()} · {certificate.chainLength} 级证书链</span></div><time>{new Date(certificate.validTo).toLocaleDateString()} 到期</time></article>)}</div> : null}{warnings.length ? <div className="import-warnings"><i className="bi bi-exclamation-triangle" aria-hidden="true" /><span>{warnings.join('；')}</span></div> : null}</> : <><Field label="证书名称" required><input required value={form.name} onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))} placeholder="例如：home.example.com" /></Field><Field label="证书与证书链（PEM）" required><textarea className="mono-input" required rows="7" value={form.certificate} onChange={(event) => setForm((current) => ({ ...current, certificate: event.target.value }))} placeholder="-----BEGIN CERTIFICATE-----" /></Field><Field label="私钥（PEM）" required><textarea className="mono-input" required rows="7" value={form.privateKey} onChange={(event) => setForm((current) => ({ ...current, privateKey: event.target.value }))} placeholder="-----BEGIN PRIVATE KEY-----" /></Field></>}{localError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{localError}</div> : null}</div><footer className="dialog-actions"><Dialog.Close className="secondary-button" disabled={saving}>取消</Dialog.Close><button className="primary-button" disabled={saving || inspecting || mode === 'files' && !previews.length}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-shield-check'}`} aria-hidden="true" />{saving ? (replacement ? '正在应用…' : '正在导入…') : replacement ? '确认替换并应用' : mode === 'files' ? previews.length ? `导入 ${previews.length} 张证书` : '导入证书' : '校验并保存'}</button></footer></form></Dialog.Popup></Dialog.Portal></Dialog.Root>;
 }
 
 function LogsPage({ logs, onRefresh, onClear }) {
   const [level, setLevel] = useState('all'); const [search, setSearch] = useState(''); const deferred = useDeferredValue(search.toLowerCase());
   const visible = logs.filter((entry) => (level === 'all' || entry.level === level) && (!deferred || `${entry.message} ${JSON.stringify(entry.meta)}`.toLowerCase().includes(deferred)));
   const download = () => downloadJson({ generatedAt: new Date().toISOString(), entries: visible }, `reverse-proxy-logs-${new Date().toISOString().slice(0, 10)}.json`);
-  return <section className="view" aria-label="日志"><article className="matte-surface logs-surface"><div className="log-toolbar"><div className="search-box"><i className="bi bi-search" aria-hidden="true" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索消息、规则或错误代码" aria-label="搜索日志" /></div><select value={level} onChange={(event) => setLevel(event.target.value)} aria-label="日志级别"><option value="all">全部级别</option><option value="error">ERROR</option><option value="warn">WARN</option><option value="info">INFO</option><option value="debug">DEBUG</option></select><button className="secondary-button" type="button" onClick={onRefresh}><i className="bi bi-arrow-clockwise" aria-hidden="true" />刷新</button><button className="secondary-button" type="button" onClick={download}><i className="bi bi-download" aria-hidden="true" />导出</button><button className="danger-button" type="button" onClick={onClear}><i className="bi bi-trash3" aria-hidden="true" />清空</button></div><div className="log-list">{visible.map((entry) => <article className="log-entry" key={entry.id}><span className={`log-level ${entry.level}`}>{entry.level.toUpperCase()}</span><time>{new Date(entry.at).toLocaleString()}</time><div><strong>{entry.message}</strong>{Object.keys(entry.meta || {}).length ? <code>{JSON.stringify(entry.meta)}</code> : null}</div></article>)}{!visible.length ? <EmptyState icon="bi-card-text" title="没有符合条件的日志" description="尝试更换日志级别或清除搜索内容。" /> : null}</div></article></section>;
+  return <section className="view" aria-label="日志"><article className="matte-surface logs-surface"><div className="log-toolbar"><div className="search-box"><i className="bi bi-search" aria-hidden="true" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索消息、规则或错误代码" aria-label="搜索日志" /></div><UISelect value={level} onChange={(event) => setLevel(event.target.value)} aria-label="日志级别"><option value="all">全部级别</option><option value="error">ERROR</option><option value="warn">WARN</option><option value="info">INFO</option><option value="debug">DEBUG</option></UISelect><button className="secondary-button" type="button" onClick={onRefresh}><i className="bi bi-arrow-clockwise" aria-hidden="true" />刷新</button><button className="secondary-button" type="button" onClick={download}><i className="bi bi-download" aria-hidden="true" />导出</button><button className="danger-button" type="button" onClick={onClear}><i className="bi bi-trash3" aria-hidden="true" />清空</button></div><div className="log-list">{visible.map((entry) => <article className="log-entry" key={entry.id}><span className={`log-level ${entry.level}`}>{entry.level.toUpperCase()}</span><time>{new Date(entry.at).toLocaleString()}</time><div><strong>{entry.message}</strong>{Object.keys(entry.meta || {}).length ? <code>{JSON.stringify(entry.meta)}</code> : null}</div></article>)}{!visible.length ? <EmptyState icon="bi-card-text" title="没有符合条件的日志" description="尝试更换日志级别或清除搜索内容。" /> : null}</div></article></section>;
 }
 
-function SettingsPage({ settings, network, status, statusState, networkAvailable, onSave, onImport, onDiagnostics, onDirtyChange, saving, importing }) {
-  const [draft, setDraft] = useState(settings);
+function SettingsPage({ settings, webhook, network, status, statusState, networkAvailable, onSave, onSaveWebhook, onTestWebhook, onImport, onDiagnostics, onDirtyChange, saving, webhookBusy, importing }) {
+  const normalizedSettings = (value = {}) => ({ ...value, unmatchedHost: { action: 'reject', statusCode: 404, redirectUrl: '', targetUrl: '', ...(value.unmatchedHost || {}) } });
+  const [draft, setDraft] = useState(() => normalizedSettings(settings));
   const [dirty, setDirty] = useState(false);
   const [intervalError, setIntervalError] = useState('');
+  const [fallbackError, setFallbackError] = useState('');
   const [submitError, setSubmitError] = useState('');
-  useEffect(() => { if (!dirty) { setDraft(settings); setIntervalError(''); setSubmitError(''); } }, [settings, dirty]);
-  useEffect(() => { onDirtyChange(dirty); }, [dirty, onDirtyChange]);
+  const [webhookDraft, setWebhookDraft] = useState(() => ({ enabled: false, url: '', events: webhookEventOptions.map(([event]) => event), headerNames: [], ...(webhook || {}), headersText: '' }));
+  const [webhookDirty, setWebhookDirty] = useState(false);
+  const [webhookError, setWebhookError] = useState('');
+  const [clearWebhookHeaders, setClearWebhookHeaders] = useState(false);
+  useEffect(() => { if (!dirty) { setDraft(normalizedSettings(settings)); setIntervalError(''); setFallbackError(''); setSubmitError(''); } }, [settings, dirty]);
+  useEffect(() => { if (!webhookDirty) { setWebhookDraft({ enabled: false, url: '', events: webhookEventOptions.map(([event]) => event), headerNames: [], ...(webhook || {}), headersText: '' }); setWebhookError(''); setClearWebhookHeaders(false); } }, [webhook, webhookDirty]);
+  useEffect(() => { onDirtyChange(dirty || webhookDirty); }, [dirty, webhookDirty, onDirtyChange]);
   const update = (key, value) => { setDirty(true); setSubmitError(''); if (key === 'healthCheckInterval') setIntervalError(''); setDraft((current) => ({ ...current, [key]: value })); };
+  const updateFallback = (key, value) => { setDirty(true); setSubmitError(''); setFallbackError(''); setDraft((current) => ({ ...current, unmatchedHost: { ...current.unmatchedHost, [key]: value } })); };
+  const updateWebhook = (key, value) => { setWebhookDirty(true); setWebhookError(''); setWebhookDraft((current) => ({ ...current, [key]: value })); };
   const save = async () => {
     const interval = Number(draft.healthCheckInterval);
     if (!Number.isInteger(interval) || interval < 5 || interval > 3600) { setIntervalError('请输入 5–3600 之间的整数秒数'); return; }
-    const result = await onSave({ ...draft, healthCheckInterval: interval });
-    if (result === true) { setDirty(false); setIntervalError(''); }
+    const fallback = draft.unmatchedHost;
+    const address = fallback.action === 'redirect' ? fallback.redirectUrl : fallback.action === 'proxy' ? fallback.targetUrl : '';
+    if (address) {
+      try { const parsed = new URL(address); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('invalid'); }
+      catch { setFallbackError('请输入无账号密码的完整 HTTP 或 HTTPS 地址'); return; }
+    }
+    const result = await onSave({ ...draft, healthCheckInterval: interval, unmatchedHost: { ...fallback, statusCode: Number(fallback.statusCode) || 404 } });
+    if (result === true) { setDirty(false); setIntervalError(''); setFallbackError(''); }
     else setSubmitError(errorText(result?.error, '设置保存未完成，请重试'));
   };
   const importFile = async (file) => {
     if (dirty && !window.confirm('当前设置尚未保存。继续导入会放弃这些修改，确定继续吗？')) return;
     const result = await onImport(file);
-    if (result === true || result?.error?.uncertain) {
-      setDirty(false);
-      setIntervalError('');
-      setSubmitError('');
+    if (result === true || result?.error?.uncertain) { setDirty(false); setIntervalError(''); setFallbackError(''); setSubmitError(''); }
+  };
+  const saveWebhook = async () => {
+    if (webhookDraft.enabled && !webhookDraft.url.trim()) { setWebhookError('启用前请填写 Webhook 地址'); return; }
+    if (webhookDraft.url.trim()) {
+      try { const parsed = new URL(webhookDraft.url); if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('invalid'); }
+      catch { setWebhookError('Webhook 地址必须是无账号密码的完整 HTTP 或 HTTPS 地址'); return; }
     }
+    if (webhookDraft.enabled && !webhookDraft.events.length) { setWebhookError('至少选择一种通知事件'); return; }
+    const parsedHeaders = parseHeadersText(webhookDraft.headersText);
+    if (webhookDraft.headersText.trim() && parsedHeaders.error) { setWebhookError(parsedHeaders.error); return; }
+    const payload = { enabled: webhookDraft.enabled, url: webhookDraft.url, events: webhookDraft.events, ...(webhookDraft.headersText.trim() ? { headers: parsedHeaders.headers } : {}), clearHeaders: clearWebhookHeaders };
+    const result = await onSaveWebhook(payload);
+    if (result === true) { setWebhookDirty(false); setWebhookError(''); setClearWebhookHeaders(false); }
+    else setWebhookError(errorText(result?.error, 'Webhook 设置保存未完成'));
   };
   const statusChipState = statusState === 'loading' ? 'starting' : statusState === 'healthy' ? 'healthy' : 'error';
   const availableAddresses = networkAvailable ? [...new Set((network.interfaces || []).map((item) => item.address).filter(Boolean))] : [];
-  return <section className="view" aria-label="设置"><div className="settings-grid"><article className="matte-surface settings-card"><div className="section-heading"><div><h2>运行检测</h2><p>定期检查全部目标端口，及时发现不可用的后端服务。</p></div>{dirty ? <span className="unsaved-badge">未保存</span> : null}</div><div className="form-stack">{submitError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{submitError}</div> : null}<Field label="健康检查间隔（秒）" hint="可设置 5–3600 秒" error={intervalError}><input type="number" min="5" max="3600" value={draft.healthCheckInterval ?? ''} onChange={(event) => update('healthCheckInterval', event.target.value)} /></Field><Field label="日志记录级别"><select value={draft.logLevel || 'info'} onChange={(event) => update('logLevel', event.target.value)}><option value="debug">DEBUG（详细）</option><option value="info">INFO（日常）</option><option value="warn">WARN（仅警告）</option><option value="error">ERROR（仅错误）</option></select></Field><button type="button" className="primary-button align-start" disabled={saving || importing || !dirty} onClick={() => void save()}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{saving ? '正在保存…' : '保存设置'}</button></div></article><article className="matte-surface settings-card"><div className="section-heading"><div><h2>配置备份</h2><p>导出规则与设置。为保护安全，备份不会包含证书私钥。</p></div></div><div className="backup-actions"><a className="primary-button" href={apiUrl('/export')} download><i className="bi bi-download" aria-hidden="true" />导出配置</a><label className="secondary-button file-button" aria-disabled={saving || importing}><i className={`bi ${importing ? 'bi-arrow-repeat' : 'bi-upload'}`} aria-hidden="true" />{importing ? '正在导入…' : '导入配置'}<input type="file" accept="application/json,.json" disabled={saving || importing} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importFile(file); event.target.value = ''; }} /></label><button type="button" className="secondary-button" onClick={onDiagnostics}><i className="bi bi-file-earmark-medical" aria-hidden="true" />诊断包</button></div><div className="backup-note"><i className="bi bi-info-circle" aria-hidden="true" /><span>合并导入时会重新生成规则标识，并保持规则停用，避免端口冲突。</span></div></article><article className="matte-surface settings-card system-card"><div className="section-heading"><div><h2>系统信息</h2></div><StatusChip state={statusChipState} label={statusChipState === 'starting' ? '检测中' : undefined} /></div><dl className="system-list"><div><dt>NAS 主机名</dt><dd>{networkAvailable ? network.hostname || '未知' : '暂无法读取'}</dd></div><div><dt>统一网关</dt><dd><code>/app/reverse-proxy</code></dd></div><div className="address-row"><dt>可用地址</dt><dd className="address-list">{!networkAvailable ? '暂无法读取' : availableAddresses.length ? availableAddresses.map((address) => <code key={address}>{address}</code>) : '未检测到'}</dd></div><div><dt>运行模式</dt><dd>{statusState === 'loading' ? '检测中' : statusState === 'error' ? '暂无法读取' : status?.demoMode ? '本地演示' : '真实代理'}</dd></div><div><dt>版本</dt><dd>{status?.version || '1.0.4'}</dd></div></dl></article></div></section>;
+  const fallback = draft.unmatchedHost || {};
+  return <section className="view" aria-label="设置"><div className="settings-grid">
+    <article className="matte-surface settings-card"><div className="section-heading"><div><h2>运行检测</h2><p>定期检查全部目标端口，及时发现不可用的后端服务。</p></div>{dirty ? <span className="unsaved-badge">未保存</span> : null}</div><div className="form-stack">{submitError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{submitError}</div> : null}<Field label="健康检查间隔（秒）" hint="可设置 5–3600 秒" error={intervalError}><input type="number" min="5" max="3600" value={draft.healthCheckInterval ?? ''} onChange={(event) => update('healthCheckInterval', event.target.value)} /></Field><Field label="日志记录级别"><UISelect value={draft.logLevel || 'info'} onChange={(event) => update('logLevel', event.target.value)}><option value="debug">DEBUG（详细）</option><option value="info">INFO（日常）</option><option value="warn">WARN（仅警告）</option><option value="error">ERROR（仅错误）</option></UISelect></Field><button type="button" className="primary-button align-start" disabled={saving || importing || !dirty} onClick={() => void save()}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{saving ? '正在保存…' : '保存设置'}</button></div></article>
+    <article className="matte-surface settings-card"><div className="section-heading"><div><h2>未匹配域名</h2><p>当请求到达 Web 入口、但 Host 不在规则域名中时采用统一兜底策略。</p></div><StatusChip state={fallback.action === 'reject' || fallback.action === 'drop' ? 'healthy' : 'warning'} label={fallback.action === 'reject' ? '默认拒绝' : fallback.action === 'drop' ? '静默丢弃' : '已配置转发'} /></div><div className="form-stack"><Field label="处理方式"><UISelect value={fallback.action || 'reject'} onChange={(event) => updateFallback('action', event.target.value)}><option value="reject">返回错误（推荐）</option><option value="drop">直接断开连接</option><option value="redirect">重定向到指定地址</option><option value="proxy">转发到默认目标</option></UISelect></Field>{fallback.action === 'reject' ? <Field label="HTTP 状态码" hint="404 不暴露可用域名；421 表示 Host 未匹配"><UISelect value={fallback.statusCode || 404} onChange={(event) => updateFallback('statusCode', Number(event.target.value))}><option value="404">404 Not Found</option><option value="421">421 Misdirected Request</option><option value="403">403 Forbidden</option></UISelect></Field> : null}{fallback.action === 'redirect' ? <Field label="重定向地址" required error={fallbackError}><input value={fallback.redirectUrl || ''} onChange={(event) => updateFallback('redirectUrl', event.target.value)} placeholder="https://example.com/" /></Field> : null}{fallback.action === 'proxy' ? <Field label="默认目标地址" required error={fallbackError} hint="仅作为未匹配 Host 的 Web 目标"><input value={fallback.targetUrl || ''} onChange={(event) => updateFallback('targetUrl', event.target.value)} placeholder="http://192.168.1.10:8080" /></Field> : null}<button type="button" className="primary-button align-start" disabled={saving || importing || !dirty} onClick={() => void save()}><i className={`bi ${saving ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{saving ? '正在保存…' : '保存设置'}</button></div></article>
+    <article className="matte-surface settings-card webhook-card"><div className="section-heading"><div><h2>Webhook 通知</h2><p>规则异常、恢复和证书生命周期事件可推送到飞书、企业微信或自建服务。</p></div><StatusChip state={webhookDraft.lastError ? 'warning' : webhookDraft.enabled ? 'healthy' : 'disabled'} label={webhookDraft.lastError ? '发送异常' : webhookDraft.enabled ? '已启用' : '未启用'} /></div><div className="form-stack">{webhookError ? <div className="form-error-banner persistent" role="alert"><i className="bi bi-exclamation-octagon" aria-hidden="true" />{webhookError}</div> : null}<CheckRow checked={Boolean(webhookDraft.enabled)} onChange={(value) => updateWebhook('enabled', value)} title="启用 Webhook" description="仅发送所选事件；请求正文为 JSON。" /><Field label="Webhook 地址" required={webhookDraft.enabled}><input value={webhookDraft.url || ''} onChange={(event) => updateWebhook('url', event.target.value)} placeholder="https://hooks.example.com/reverse-proxy" /></Field><fieldset className="webhook-events"><legend>通知事件</legend><div>{webhookEventOptions.map(([event, label]) => { const active = webhookDraft.events.includes(event); return <button type="button" key={event} className={active ? 'selected' : ''} aria-pressed={active} onClick={() => updateWebhook('events', active ? webhookDraft.events.filter((item) => item !== event) : [...webhookDraft.events, event])}><i className={`bi ${active ? 'bi-check-circle-fill' : 'bi-circle'}`} aria-hidden="true" />{label}</button>; })}</div></fieldset><Field label="自定义请求头" hint={webhookDraft.headerNames?.length ? `已保存：${webhookDraft.headerNames.join('、')}；留空会继续保留` : '每行一个，例如 Authorization: Bearer ...；值不会回显'}><textarea rows="3" value={webhookDraft.headersText || ''} onChange={(event) => { setClearWebhookHeaders(false); updateWebhook('headersText', event.target.value); }} placeholder="Authorization: Bearer token" /></Field>{webhookDraft.headerNames?.length ? <CheckRow checked={clearWebhookHeaders} onChange={(value) => { setClearWebhookHeaders(value); setWebhookDirty(true); }} title="清除已保存的请求头" description="保存后删除所有自定义请求头；Webhook 地址和事件不受影响。" /> : null}<div className="webhook-actions"><button type="button" className="primary-button" disabled={webhookBusy || !webhookDirty} onClick={() => void saveWebhook()}><i className={`bi ${webhookBusy ? 'bi-arrow-repeat' : 'bi-floppy'}`} aria-hidden="true" />{webhookBusy ? '处理中…' : '保存 Webhook'}</button><button type="button" className="secondary-button" disabled={webhookBusy || webhookDirty || !webhookDraft.url} title={webhookDirty ? '请先保存修改' : ''} onClick={() => void onTestWebhook()}><i className="bi bi-send-check" aria-hidden="true" />发送测试</button></div>{webhookDraft.lastDeliveryAt ? <small className={`webhook-delivery${webhookDraft.lastError ? ' error' : ''}`}>{webhookDraft.lastError ? `最近发送失败：${webhookDraft.lastError}` : '最近发送成功'} · {formatMoment(webhookDraft.lastDeliveryAt)}</small> : null}</div></article>
+    <article className="matte-surface settings-card"><div className="section-heading"><div><h2>配置备份</h2><p>导出规则与设置。为保护安全，备份不会包含证书私钥。</p></div></div><div className="backup-actions"><a className="primary-button" href={apiUrl('/export')} download><i className="bi bi-download" aria-hidden="true" />导出配置</a><label className="secondary-button file-button" aria-disabled={saving || importing}><i className={`bi ${importing ? 'bi-arrow-repeat' : 'bi-upload'}`} aria-hidden="true" />{importing ? '正在导入…' : '导入配置'}<input type="file" accept="application/json,.json" disabled={saving || importing} onChange={(event) => { const file = event.target.files?.[0]; if (file) void importFile(file); event.target.value = ''; }} /></label><button type="button" className="secondary-button" onClick={onDiagnostics}><i className="bi bi-file-earmark-medical" aria-hidden="true" />诊断包</button></div><div className="backup-note"><i className="bi bi-info-circle" aria-hidden="true" /><span>合并导入时会重新生成规则标识，并保持规则停用，避免端口冲突。</span></div></article>
+    <article className="matte-surface settings-card"><div className="section-heading"><div><h2>系统信息</h2></div><StatusChip state={statusChipState} label={statusChipState === 'starting' ? '检测中' : undefined} /></div><dl className="system-list"><div><dt>NAS 主机名</dt><dd>{networkAvailable ? network.hostname || '未知' : '暂无法读取'}</dd></div><div><dt>统一网关</dt><dd><code>/app/reverse-proxy</code></dd></div><div className="address-row"><dt>可用地址</dt><dd className="address-list">{!networkAvailable ? '暂无法读取' : availableAddresses.length ? availableAddresses.map((address) => <code key={address}>{address}</code>) : '未检测到'}</dd></div><div><dt>运行模式</dt><dd>{statusState === 'loading' ? '检测中' : statusState === 'error' ? '暂无法读取' : status?.demoMode ? '本地演示' : '真实代理'}</dd></div><div><dt>版本</dt><dd>{status?.version || APP_VERSION}</dd></div></dl></article>
+  </div></section>;
 }
 
 function AboutPage({ version }) {
   return <section className="view" aria-label="关于"><article className="matte-surface about-card">
     <div className="about-brand"><img src="/app/reverse-proxy/images/reverse-proxy.png" alt="反向代理：请求经过网关转发到目标服务" /><div><h2>反向代理</h2><p>面向飞牛 fnOS 的多协议反向代理工具。</p></div></div>
     <dl className="about-list">
-      <div><dt>版本</dt><dd>{version || '1.0.4'}</dd></div>
+      <div><dt>版本</dt><dd>{version || APP_VERSION}</dd></div>
       <div><dt>项目地址</dt><dd><a href={PROJECT_URL} target="_blank" rel="noreferrer">{PROJECT_URL}<i className="bi bi-box-arrow-up-right" aria-hidden="true" /></a></dd></div>
       <div><dt>许可</dt><dd>Copyright © 2026 BearHero</dd></div>
     </dl>
   </article></section>;
 }
 
-const resourceKeys = ['status', 'rules', 'certificates', 'logs', 'settings', 'network'];
+const resourceKeys = ['status', 'rules', 'certificates', 'certificatePush', 'ddns', 'issuance', 'deployment', 'logs', 'settings', 'webhook', 'network'];
 const createResourceState = () => Object.fromEntries(resourceKeys.map((key) => [key, { loading: true, error: '', hasData: false, lastSuccessAt: null }]));
 
 function DataNotice({ messages, onRetry }) {
@@ -671,8 +843,13 @@ export function App() {
   const [runtime, setRuntime] = useState({});
   const [certificates, setCertificates] = useState([]);
   const [certificateSources, setCertificateSources] = useState({ system: null });
+  const [certificatePush, setCertificatePush] = useState({ enabled: false });
+  const [ddns, setDdns] = useState(emptyDdns);
+  const [deployment, setDeployment] = useState(emptyDeployment);
+  const [issuance, setIssuance] = useState(emptyIssuance);
   const [logs, setLogs] = useState([]);
-  const [settings, setSettings] = useState({ healthCheckInterval: 30, logLevel: 'info' });
+  const [settings, setSettings] = useState({ healthCheckInterval: 30, logLevel: 'info', unmatchedHost: { action: 'reject', statusCode: 404, redirectUrl: '', targetUrl: '' } });
+  const [webhook, setWebhook] = useState({ enabled: false, url: '', events: webhookEventOptions.map(([event]) => event), headerNames: [] });
   const [network, setNetwork] = useState({ interfaces: [] });
   const [resources, setResources] = useState(createResourceState);
   const [settingsDirty, setSettingsDirty] = useState(false);
@@ -681,6 +858,7 @@ export function App() {
   const [toast, setToast] = useState(null);
   const [ruleDialog, setRuleDialog] = useState({ open: false, rule: null });
   const [certificateOpen, setCertificateOpen] = useState(false);
+  const [replacementCertificate, setReplacementCertificate] = useState(null);
   const toastTimer = useRef(null);
   const coreRequest = useRef(0);
   const logsRequest = useRef(0);
@@ -755,22 +933,30 @@ export function App() {
         status: { ...current.status, loading: true },
         rules: { ...current.rules, loading: true },
         certificates: { ...current.certificates, loading: true },
+        certificatePush: { ...current.certificatePush, loading: true },
+        ddns: { ...current.ddns, loading: true },
+        deployment: { ...current.deployment, loading: true },
+        issuance: { ...current.issuance, loading: true },
       }));
     }
-    const results = await Promise.allSettled([api('/status'), api('/rules'), api('/certificates')]);
+    const results = await Promise.allSettled([api('/status'), api('/rules'), api('/certificates'), api('/integrations/certificate-push'), api('/integrations/ddns'), api('/integrations/certificate-issuance'), api('/integrations/fnos-deployment')]);
     if (requestId !== coreRequest.current) return;
-    const [statusResult, rulesResult, certificatesResult] = results;
+    const [statusResult, rulesResult, certificatesResult, certificatePushResult, ddnsResult, issuanceResult, deploymentResult] = results;
     const completedAt = Date.now();
     if (statusResult.status === 'fulfilled') setStatus(statusResult.value);
-    else setStatus((current) => ({ ...(current || {}), ok: false, version: current?.version || '1.0.4' }));
+    else setStatus((current) => ({ ...(current || {}), ok: false, version: current?.version || APP_VERSION }));
     if (rulesResult.status === 'fulfilled') { setRules(rulesResult.value.rules || []); setRuntime(rulesResult.value.runtime || {}); }
     if (certificatesResult.status === 'fulfilled') {
       setCertificates(certificatesResult.value.certificates || []);
       setCertificateSources(certificatesResult.value.sources || { system: null });
     }
+    if (certificatePushResult.status === 'fulfilled') setCertificatePush(certificatePushResult.value.integration || { enabled: false });
+    if (ddnsResult.status === 'fulfilled') setDdns(ddnsResult.value.integration || emptyDdns);
+    if (deploymentResult.status === 'fulfilled') setDeployment(deploymentResult.value.integration || emptyDeployment);
+    if (issuanceResult.status === 'fulfilled') setIssuance(issuanceResult.value.integration || emptyIssuance);
     setResources((current) => {
       const next = { ...current };
-      [['status', statusResult], ['rules', rulesResult], ['certificates', certificatesResult]].forEach(([key, result]) => {
+      [['status', statusResult], ['rules', rulesResult], ['certificates', certificatesResult], ['certificatePush', certificatePushResult], ['ddns', ddnsResult], ['issuance', issuanceResult], ['deployment', deploymentResult]].forEach(([key, result]) => {
         const success = result.status === 'fulfilled';
         next[key] = {
           ...current[key],
@@ -803,15 +989,16 @@ export function App() {
   }, [notify]);
   const loadSettings = useCallback(async (quiet = false) => {
     const requestId = ++settingsRequest.current;
-    setResources((current) => ({ ...current, settings: { ...current.settings, loading: true }, network: { ...current.network, loading: true } }));
-    const results = await Promise.allSettled([api('/settings'), api('/network')]);
+    setResources((current) => ({ ...current, settings: { ...current.settings, loading: true }, webhook: { ...current.webhook, loading: true }, network: { ...current.network, loading: true } }));
+    const results = await Promise.allSettled([api('/settings'), api('/network'), api('/integrations/webhook')]);
     if (requestId !== settingsRequest.current) return;
     if (results[0].status === 'fulfilled') setSettings(results[0].value.settings || {});
     if (results[1].status === 'fulfilled') setNetwork(results[1].value || { interfaces: [] });
+    if (results[2].status === 'fulfilled') setWebhook(results[2].value.integration || { enabled: false, url: '', events: webhookEventOptions.map(([event]) => event), headerNames: [] });
     const completedAt = Date.now();
     setResources((current) => {
       const next = { ...current };
-      [['settings', results[0]], ['network', results[1]]].forEach(([key, result]) => {
+      [['settings', results[0]], ['network', results[1]], ['webhook', results[2]]].forEach(([key, result]) => {
         const success = result.status === 'fulfilled';
         next[key] = {
           ...current[key],
@@ -872,21 +1059,36 @@ export function App() {
     const result = await api(editing ? `/rules/${editing.id}` : '/rules', { method: editing ? 'PUT' : 'POST', body: draft });
     setRuleDialog({ open: false, rule: null });
     const run = result.runtime;
-    if (run && !['healthy', 'disabled'].includes(run.state)) notify(`规则已保存，但未能正常启动：${run.message || '请检查配置'}`, 'error');
+    if (run && !['healthy', 'disabled', 'scheduled'].includes(run.state)) notify(`规则已保存，但未能正常启动：${run.message || '请检查配置'}`, 'error');
     else notify(editing ? '规则已更新并应用' : draft.enabled ? '规则已创建并开始监听' : '规则已创建，当前保持停用');
     await loadCore(true);
   }, () => loadCore(true));
   const toggleRule = (rule, enabled) => withBusy(rule.id, async () => {
     const result = await api(`/rules/${rule.id}/toggle`, { method: 'POST', body: { enabled } });
-    if (enabled && result.runtime && result.runtime.state !== 'healthy') notify(`规则已启用，但启动失败：${result.runtime.message || '请检查配置'}`, 'error');
+    if (enabled && result.runtime && !['healthy', 'scheduled'].includes(result.runtime.state)) notify(`规则已启用，但启动失败：${result.runtime.message || '请检查配置'}`, 'error');
     else notify(enabled ? '规则已启用' : '规则已停用');
     await loadCore(true);
   }, () => loadCore(true));
   const duplicateRule = (rule) => withBusy(rule.id, async () => { await api(`/rules/${rule.id}/duplicate`, { method: 'POST' }); notify('已创建停用状态的规则副本'); await loadCore(true); }, () => loadCore(true));
+  const batchRules = (ids, action) => {
+    if (action === 'delete' && !window.confirm(`确定删除选中的 ${ids.length} 条规则吗？此操作无法撤销。`)) return Promise.resolve({ ok: false, cancelled: true });
+    return withBusy('batch-rules', async () => {
+      await api('/rules/batch', { method: 'POST', body: { ids, action } });
+      notify(action === 'enable' ? `已启用 ${ids.length} 条规则` : action === 'disable' ? `已停用 ${ids.length} 条规则` : `已删除 ${ids.length} 条规则`);
+      await loadCore(true);
+    }, () => loadCore(true));
+  };
   const deleteRule = (rule) => { if (!window.confirm(`确定删除“${rule.name}”吗？此操作无法撤销。`)) return; void withBusy(rule.id, async () => { await api(`/rules/${rule.id}`, { method: 'DELETE' }); notify('规则已删除'); await loadCore(true); }, () => loadCore(true)); };
   const testRule = (rule) => withBusy(rule.id, async () => { const result = await api(`/rules/${rule.id}/test`, { method: 'POST', timeoutMs: 15000, idempotent: true }); notify(result.runtime?.state === 'healthy' ? `全部目标连接正常，延迟 ${result.runtime.latencyMs || '—'} ms` : result.runtime?.message || '目标连接异常', result.runtime?.state === 'healthy' ? 'ok' : 'error'); await loadCore(true); }, () => loadCore(true));
   const inspectCertificates = (payload) => api('/certificates/inspect', { method: 'POST', body: payload, timeoutMs: 30000, idempotent: true });
-  const saveCertificate = (form) => withBusy('save-certificate', async () => { const result = form.kind === 'files' ? await api('/certificates/import', { method: 'POST', body: { files: form.files, passphrase: form.passphrase, name: form.name } }) : await api('/certificates', { method: 'POST', body: form }); setCertificateOpen(false); const count = result.certificates?.length ?? 1; notify(count ? `已解析并导入 ${count} 张证书` : result.warnings?.[0] || '所选证书已存在'); await loadCore(true); }, () => loadCore(true));
+  const saveCertificate = (form) => withBusy('save-certificate', async () => { const result = replacementCertificate ? await api(`/certificates/${replacementCertificate.id}`, { method: 'PUT', body: form }) : form.kind === 'files' ? await api('/certificates/import', { method: 'POST', body: { files: form.files, passphrase: form.passphrase, name: form.name } }) : await api('/certificates', { method: 'POST', body: form }); setCertificateOpen(false); const count = result.certificates?.length ?? 1; notify(replacementCertificate ? '证书已替换并应用，原有绑定保持不变' : count ? `已解析并导入 ${count} 张证书` : result.warnings?.[0] || '所选证书已存在'); await loadCore(true); }, () => loadCore(true));
+  const importForRule = async (form) => {
+    const result = form.kind === 'files' ? await api('/certificates/import', { method: 'POST', body: form }) : await api('/certificates', { method: 'POST', body: form });
+    await loadCore(true);
+    const cert = result.certificate || result.certificates?.[0];
+    if (!cert) throw new Error('证书已存在，请返回规则选择已有证书');
+    return cert;
+  };
   const deleteCertificate = (certificate) => { if (!window.confirm(`确定删除证书“${certificate.name}”吗？`)) return; void withBusy(certificate.id, async () => { await api(`/certificates/${certificate.id}`, { method: 'DELETE' }); notify('证书已删除'); await loadCore(true); }, () => loadCore(true)); };
   const reloadSystemCertificates = () => withBusy('reload-system-certificates', async () => {
     const result = await api('/certificates/system/reload', { method: 'POST', idempotent: true, timeoutMs: 30000 });
@@ -897,20 +1099,92 @@ export function App() {
     else notify(result.status?.message || '系统证书暂不可读取，应用证书不受影响', 'error');
     await loadCore(true);
   }, () => loadCore(true));
+  const rotateCertificatePush = async () => {
+    let created = null;
+    const outcome = await withBusy('certificate-push', async () => {
+      const result = await api('/integrations/certificate-push/rotate', { method: 'POST', idempotent: true });
+      created = result.integration;
+      setCertificatePush(({ token, ...current }) => ({ ...current, ...created, token: undefined }));
+      notify('证书推送凭据已生成，请立即保存令牌');
+    }, () => loadCore(true));
+    return outcome === true ? created : outcome;
+  };
+  const disableCertificatePush = () => withBusy('certificate-push', async () => {
+    const result = await api('/integrations/certificate-push', { method: 'DELETE', idempotent: true });
+    setCertificatePush(result.integration || { enabled: false });
+    notify('外部证书推送已停用');
+  }, () => loadCore(true));
   const clearLogs = () => { if (!window.confirm('确定清空诊断日志吗？')) return; void withBusy('clear-logs', async () => { await api('/logs?confirm=clear', { method: 'DELETE' }); notify('日志已清空'); await loadLogs(true); }, () => loadLogs(true)); };
   const importConfig = (file) => withBusy('import', async () => { let config; try { config = JSON.parse(await file.text()); } catch { throw new Error('配置文件不是有效的 JSON'); } const result = await api('/import', { method: 'POST', body: { config, replace: false } }); settingsDirtyRef.current = false; setSettingsDirty(false); notify(`已导入 ${result.imported} 条规则，默认保持停用`); await Promise.all([loadCore(true), loadSettings(true)]); }, () => Promise.all([loadCore(true), loadSettings(true)]));
   const diagnostics = () => withBusy('diagnostics', async () => { const data = await api('/diagnostics'); downloadJson(data, `reverse-proxy-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`); notify('诊断包已生成'); });
+  const saveWebhook = (next) => withBusy('webhook', async () => {
+    const result = await api('/integrations/webhook', { method: 'PUT', body: next });
+    setWebhook(result.integration || next);
+    setResources((current) => ({ ...current, webhook: { ...current.webhook, error: '', hasData: true, lastSuccessAt: Date.now() } }));
+    notify('Webhook 设置已保存');
+  }, () => loadSettings(true));
+  const testWebhook = () => withBusy('webhook', async () => { await api('/integrations/webhook/test', { method: 'POST', idempotent: true, timeoutMs: 12000 }); notify('Webhook 测试通知已送达'); await loadSettings(true); }, () => loadSettings(true));
+  const saveDdns = (next) => withBusy('ddns', async () => {
+    const result = await api('/integrations/ddns', { method: 'PUT', body: next });
+    setDdns((current) => ({ ...current, ...result.integration }));
+    notify('DDNS 设置已保存');
+  }, () => loadCore(true));
+  const saveIssuance = (next) => withBusy('issuance', async () => {
+    const result = await api('/integrations/certificate-issuance', { method: 'PUT', body: next });
+    setIssuance(result.integration || emptyIssuance);
+    notify('证书签发设置已保存');
+  }, () => loadCore(true));
+  const syncDdns = () => withBusy('ddns', async () => {
+    const result = await api('/integrations/ddns/sync', { method: 'POST', idempotent: true, timeoutMs: 60000 });
+    setDdns((current) => ({ ...current, ...result.integration }));
+    notify(result.result?.demoMode ? '演示模式未修改 DNS' : result.result?.changed ? `DNS 已更新为 ${result.result.ip}` : `DNS 已是最新：${result.result?.ip || '无需修改'}`);
+  }, () => loadCore(true));
+  const testDdns = () => withBusy('ddns', async () => {
+    const result = await api('/integrations/ddns/test', { method: 'POST', idempotent: true, timeoutMs: 60000 });
+    notify(result.result?.demoMode ? '演示模式未请求云端；请在 NAS 上测试真实连接' : result.result?.message || 'DNS 查询连接正常');
+  }, () => loadCore(true));
+  const detectDdns = (recordType) => withBusy('ddns-detect', async () => {
+    const result = await api('/integrations/ddns/detect', { method: 'POST', body: { recordType }, timeoutMs: 15000, idempotent: true });
+    setDdns((current) => ({ ...current, detection: result.detection }));
+    notify(result.result.demoMode ? result.result.message : `已检测到公网地址：${result.result.ip}，未修改 DNS`);
+  }, () => loadCore(true));
+  const saveDeployment = (next) => withBusy('deployment', async () => {
+    const result = await api('/integrations/fnos-deployment', { method: 'PUT', body: next });
+    setDeployment(result.integration); notify('部署设置已保存');
+  }, () => loadCore(true));
+  const refreshDeployment = () => withBusy('deployment', async () => {
+    const result = await api('/integrations/fnos-deployment/refresh', { method: 'POST', timeoutMs: 65000, idempotent: true });
+    setDeployment(result.integration); notify(result.integration.helper.available ? '助手已连接，系统证书列表已更新' : result.integration.helper.message, result.integration.helper.available ? 'ok' : 'error');
+  });
+  const prepareDeployment = async () => {
+    let response;
+    const result = await withBusy('deployment', async () => { response = await api('/integrations/fnos-deployment/prepare', { method: 'POST', timeoutMs: 65000, idempotent: true }); });
+    return result === true ? response : result;
+  };
+  const deployToFnos = (body) => withBusy('deployment', async () => {
+    const result = await api('/integrations/fnos-deployment/deploy', { method: 'POST', body });
+    setDeployment(result.integration); notify('部署任务已启动，结果会自动刷新；请勿同时修改系统证书');
+  }, () => loadCore(true));
+  const issuanceAction = (action, body, message) => withBusy('issuance', async () => {
+    const result = await api(`/integrations/certificate-issuance/${action}`, { method: 'POST', body, timeoutMs: 120000 });
+    setIssuance(result.integration || emptyIssuance);
+    notify(result.result?.demoMode ? '演示模式未请求云端，也未消耗额度' : message);
+    await loadCore(true);
+  }, () => loadCore(true));
 
   const routeResources = {
     rules: ['status', 'rules', 'certificates'],
-    certificates: ['status', 'certificates', 'rules'],
+    certificates: ['status', 'certificates', 'certificatePush', 'rules'],
+    ddns: ['status', 'ddns'],
+    deployment: ['status', 'deployment', 'certificates'],
+    issuance: ['status', 'issuance', 'certificates'],
     logs: ['status', 'logs'],
-    settings: ['status', 'settings', 'network'],
+    settings: ['status', 'settings', 'webhook', 'network'],
     about: ['status'],
   }[route];
-  const primaryKey = { rules: 'rules', certificates: 'certificates', logs: 'logs', settings: 'settings', about: 'status' }[route];
+  const primaryKey = { rules: 'rules', certificates: 'certificates', ddns: 'ddns', issuance: 'issuance', deployment: 'deployment', logs: 'logs', settings: 'settings', about: 'status' }[route];
   const primaryResource = resources[primaryKey];
-  const resourceLabels = { status: '服务状态', rules: '规则', certificates: '证书', logs: '日志', settings: '设置', network: '网络信息' };
+  const resourceLabels = { status: '服务状态', rules: '规则', certificates: '证书', certificatePush: '证书推送', ddns: 'DDNS', issuance: '证书签发', deployment: '系统部署', logs: '日志', settings: '设置', webhook: 'Webhook', network: '网络信息' };
   const resourceErrors = routeResources.filter((key) => resources[key].error).map((key) => `${resourceLabels[key]}：${resources[key].error}`);
   const firstLoadPending = primaryResource.loading && !primaryResource.hasData;
   const firstLoadFailed = Boolean(primaryResource.error && !primaryResource.hasData);
@@ -918,10 +1192,14 @@ export function App() {
   const serviceState = resources.status.loading && !resources.status.hasData ? 'loading' : resources.status.hasData && status?.ok ? 'healthy' : 'error';
 
   let page = null;
-  if (route === 'rules') page = <RulesPage status={status} rules={rules} runtime={runtime} busy={busy} onCreate={() => setRuleDialog({ open: true, rule: null })} onEdit={(rule) => setRuleDialog({ open: true, rule })} onToggle={toggleRule} onDuplicate={duplicateRule} onDelete={deleteRule} onTest={testRule} />;
-  if (route === 'certificates') page = <CertificatesPage certificates={certificates} systemSource={certificateSources.system} rules={rules} rulesAvailable={resources.rules.hasData} systemReloading={busy.has('reload-system-certificates')} onCreate={() => setCertificateOpen(true)} onDelete={deleteCertificate} onReloadSystem={() => void reloadSystemCertificates()} />;
+  if (route === 'rules') page = <RulesPage status={status} rules={rules} runtime={runtime} busy={busy} onCreate={() => setRuleDialog({ open: true, rule: null })} onEdit={(rule) => setRuleDialog({ open: true, rule })} onToggle={toggleRule} onDuplicate={duplicateRule} onDelete={deleteRule} onTest={testRule} onBatch={batchRules} />;
+  if (route === 'certificates') page = <CertificatesPage certificates={certificates} systemSource={certificateSources.system} certificatePush={certificatePush} rules={rules} rulesAvailable={resources.rules.hasData} systemReloading={busy.has('reload-system-certificates')} pushBusy={busy.has('certificate-push')} onCreate={() => { setReplacementCertificate(null); setCertificateOpen(true); }} onReplace={(certificate) => { setReplacementCertificate(certificate); setCertificateOpen(true); }} onDelete={deleteCertificate} onReloadSystem={() => void reloadSystemCertificates()} onRotatePush={rotateCertificatePush} onDisablePush={() => void disableCertificatePush()} />;
+  if (route === 'ddns') page = <DdnsPage integration={ddns} busy={busy.has('ddns') || ddns.running} detectBusy={busy.has('ddns-detect')} onDetect={(type) => void detectDdns(type)} onSave={saveDdns} onSync={() => void syncDdns()} onTest={() => void testDdns()} />;
+  if (route === 'deployment') page = <FnosDeploymentPage onImport={() => { setReplacementCertificate(null); setCertificateOpen(true); }} integration={deployment} certificates={certificates} busy={busy.has('deployment') || deployment.running} onSave={saveDeployment} onRefresh={() => void refreshDeployment()} onPrepare={prepareDeployment} onDeploy={deployToFnos} onCertificates={() => navigate('certificates')} />;
+  const issuancePanel = <IssuancePage onRefresh={async () => { const result = await api('/integrations/certificate-issuance'); setIssuance(result.integration || emptyIssuance); }} integration={issuance} certificates={certificates} busy={busy.has('issuance')} onSave={saveIssuance} onIssue={() => void issuanceAction('issue', undefined, '签发任务已开始，可关闭页面，进度会自动刷新')} onQuota={() => void issuanceAction('aliyun/quota', undefined, '免费额度已更新')} onAssociate={(orderId) => issuanceAction('aliyun/associate', { orderId }, '订单已关联，将继续查询签发状态')} onRetry={() => void issuanceAction('aliyun/retry', undefined, '已重新申请，请留意签发进度')} onReset={() => void issuanceAction('aliyun/reset', { confirmedNoOrder: true }, '本次申请已重置，自动轮换已暂停')} onCertificates={() => navigate('certificates')} />;
+  if (route === 'issuance') page = issuancePanel;
   if (route === 'logs') page = <LogsPage logs={logs} onRefresh={() => void loadLogs()} onClear={clearLogs} />;
-  if (route === 'settings') page = <SettingsPage settings={settings} network={network} status={status} statusState={serviceState} networkAvailable={resources.network.hasData} saving={busy.has('settings')} importing={busy.has('import')} onDirtyChange={setSettingsDirty} onSave={(next) => withBusy('settings', async () => { const result = await api('/settings', { method: 'PUT', body: next }); setSettings(result.settings || next); setResources((current) => ({ ...current, settings: { ...current.settings, error: '', hasData: true, lastSuccessAt: Date.now() } })); notify('设置已保存'); }, () => loadSettings(true))} onImport={importConfig} onDiagnostics={diagnostics} />;
+  if (route === 'settings') page = <SettingsPage settings={settings} webhook={webhook} network={network} status={status} statusState={serviceState} networkAvailable={resources.network.hasData} saving={busy.has('settings')} webhookBusy={busy.has('webhook')} importing={busy.has('import')} onDirtyChange={setSettingsDirty} onSave={(next) => withBusy('settings', async () => { const result = await api('/settings', { method: 'PUT', body: next }); setSettings(result.settings || next); setResources((current) => ({ ...current, settings: { ...current.settings, error: '', hasData: true, lastSuccessAt: Date.now() } })); notify('设置已保存'); }, () => loadSettings(true))} onSaveWebhook={saveWebhook} onTestWebhook={testWebhook} onImport={importConfig} onDiagnostics={diagnostics} />;
   if (route === 'about') page = <AboutPage version={status?.version} />;
 
   return (
@@ -930,11 +1208,11 @@ export function App() {
       <Sidebar route={route} onNavigate={navigate} serviceState={serviceState} version={status?.version} />
       <main className="main-canvas" id="main" ref={mainRef} tabIndex="-1">
         {route !== 'rules' ? <PageHeader route={route} serviceState={serviceState} loading={pageLoading} onRefresh={() => void refreshCurrent()} /> : null}
-        {firstLoadPending ? <div className="loading-screen" role="status"><i className="bi bi-arrow-repeat" aria-hidden="true" /><span>正在读取${resourceLabels[primaryKey]}…</span></div> : firstLoadFailed ? <ResourceUnavailable message={primaryResource.error} onRetry={() => void refreshCurrent()} /> : <><DataNotice messages={resourceErrors} onRetry={() => void refreshCurrent()} />{page}</>}
+        {firstLoadPending ? <div className="loading-screen" role="status"><i className="bi bi-arrow-repeat" aria-hidden="true" /><span>正在读取${resourceLabels[primaryKey]}…</span></div> : firstLoadFailed ? <ResourceUnavailable message={primaryResource.error} onRetry={() => void refreshCurrent()} /> : <><DataNotice messages={resourceErrors} onRetry={() => void refreshCurrent()} />{['certificates', 'issuance', 'deployment'].includes(route) ? <nav className="certificate-route-tabs" aria-label="域名与证书"><button className={route === 'certificates' ? 'active' : ''} onClick={() => navigate('certificates')}>我的证书</button><button className={route === 'issuance' ? 'active' : ''} onClick={() => navigate('issuance')}>自动申请</button><button className={route === 'deployment' ? 'active' : ''} onClick={() => navigate('deployment')}>系统 HTTPS</button></nav> : null}{page}</>}
       </main>
       <Toast toast={toast} />
-      <RuleDialog open={ruleDialog.open} rule={ruleDialog.rule} certificates={certificates} certificatesAvailable={resources.certificates.hasData} saving={busy.has('save-rule')} onClose={() => setRuleDialog({ open: false, rule: null })} onSave={saveRule} />
-      <CertificateDialog open={certificateOpen} saving={busy.has('save-certificate')} onClose={() => setCertificateOpen(false)} onInspect={inspectCertificates} onSave={saveCertificate} />
+      <RuleDialog issuancePanel={issuancePanel} onInspect={inspectCertificates} onImportCertificate={importForRule} open={ruleDialog.open} rule={ruleDialog.rule} certificates={certificates} certificatesAvailable={resources.certificates.hasData} saving={busy.has('save-rule')} onClose={() => setRuleDialog({ open: false, rule: null })} onSave={saveRule} />
+      <CertificateDialog replacement={replacementCertificate} affectedRules={rules.filter((rule) => rule.tls?.certId === replacementCertificate?.id)} open={certificateOpen} saving={busy.has('save-certificate')} onClose={() => setCertificateOpen(false)} onInspect={inspectCertificates} onSave={saveCertificate} />
     </div>
   );
 }

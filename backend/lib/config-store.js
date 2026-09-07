@@ -1,15 +1,18 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import { validateHeaderName, validateHeaderValue } from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { sanitizeCertificate } from './system-certificate-store.js';
+import { normalizeDdns, defaultIssuance, migrateDomainAutomation, publicDdns, publicIssuance, updateDdnsConfig, updateIssuanceConfig } from './automation-config.js';
 
 export const SOURCE_PROTOCOLS = new Set(['http', 'ws', 'https', 'wss', 'tcp', 'udp']);
 export const TARGET_PROTOCOLS = new Set(['http', 'ws', 'https', 'wss', 'tcp', 'udp']);
 export const PROTOCOLS = new Set([...SOURCE_PROTOCOLS, 'tcp+udp']);
+export const WEBHOOK_EVENTS = new Set(['rule.error', 'rule.recovered', 'certificate.expiring', 'certificate.updated']);
 
 const now = () => new Date().toISOString();
+const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
 const text = (value, fallback = '') => String(value ?? fallback).trim();
 const bool = (value, fallback = false) => {
   if (value === undefined) return fallback;
@@ -23,6 +26,59 @@ const integer = (value, fallback, min, max) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
 };
+
+const defaultUnmatchedHost = () => ({ action: 'reject', statusCode: 404, redirectUrl: '', targetUrl: '' });
+const defaultSchedule = () => ({ enabled: false, days: [0, 1, 2, 3, 4, 5, 6], start: '00:00', end: '23:59' });
+const defaultSettings = () => ({ healthCheckInterval: 30, logLevel: 'info', startOnBoot: true, unmatchedHost: defaultUnmatchedHost() });
+
+function normalizeTime(value, fallback) {
+  const candidate = text(value, fallback);
+  return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(candidate) ? candidate : fallback;
+}
+
+export function normalizeSchedule(value = {}) {
+  const rawDays = Array.isArray(value.days) ? value.days : defaultSchedule().days;
+  const days = [...new Set(rawDays.map((day) => Number(day)).filter((day) => Number.isInteger(day) && day >= 0 && day <= 6))].sort((a, b) => a - b);
+  return {
+    enabled: bool(value.enabled, false),
+    days: Array.isArray(value.days) ? days : defaultSchedule().days,
+    start: normalizeTime(value.start, '00:00'),
+    end: normalizeTime(value.end, '23:59'),
+  };
+}
+
+const timeMinutes = (value) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3));
+
+export function isRuleScheduleOpen(rule, date = new Date()) {
+  const schedule = normalizeSchedule(rule?.schedule);
+  if (!schedule.enabled) return true;
+  const minute = date.getHours() * 60 + date.getMinutes();
+  const start = timeMinutes(schedule.start);
+  const end = timeMinutes(schedule.end);
+  const day = date.getDay();
+  if (start <= end) return schedule.days.includes(day) && minute >= start && minute <= end;
+  const previousDay = (day + 6) % 7;
+  return schedule.days.includes(day) && minute >= start || schedule.days.includes(previousDay) && minute <= end;
+}
+
+function normalizeUnmatchedHost(value = {}, existing = defaultUnmatchedHost()) {
+  const action = ['reject', 'drop', 'redirect', 'proxy'].includes(value.action) ? value.action : existing.action || 'reject';
+  return {
+    action,
+    statusCode: action === 'reject' ? integer(value.statusCode, existing.statusCode || 404, 400, 499) : 404,
+    redirectUrl: text(value.redirectUrl, existing.redirectUrl),
+    targetUrl: text(value.targetUrl, existing.targetUrl),
+  };
+}
+
+function validateHttpUrl(value, label, errors) {
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error('invalid');
+  } catch {
+    errors.push(`${label}必须是无账号密码的 HTTP 或 HTTPS 地址`);
+  }
+}
 
 export function list(value) {
   if (Array.isArray(value)) return [...new Set(value.map((entry) => text(entry)).filter(Boolean))];
@@ -204,6 +260,7 @@ export function normalizeRule(input = {}, existing = null) {
       header: text(input.realIp?.header, 'X-Forwarded-For'),
     },
     tls: { certId: text(input.tls?.certId) },
+    schedule: normalizeSchedule(input.schedule),
     createdAt,
     updatedAt: now(),
   };
@@ -277,6 +334,7 @@ export function validateRule(rule, rules = [], { certificateIds = null, allowMis
   validateHeaders(rule, errors);
   validateIpEntries(rule.allowIps, '白名单', errors);
   validateIpEntries(rule.blockIps, '黑名单', errors);
+  if (rule.schedule?.enabled && !rule.schedule.days?.length) errors.push('计划启停至少需要选择一天');
   const tcpGroups = sourceGroups(rule.protocols).filter((protocol) => protocol !== 'udp');
   if (tcpGroups.length > 1) errors.push('同一组监听端口只能选择一组 TCP 类入口：HTTP/WS、HTTPS/WSS 或 TCP');
   const groups = sourceGroups(rule.protocols);
@@ -310,6 +368,40 @@ export function validateRule(rule, rules = [], { certificateIds = null, allowMis
   return rule;
 }
 
+export function validateTargetSafety(rule, { localHosts = [], reservedPorts = [] } = {}) {
+  if (!rule.enabled) return rule;
+  const host = normalizedListenHost(rule.targetHost);
+  const knownLocal = new Set(['localhost', 'ip6-localhost', '127.0.0.1', '::1', ...localHosts.map(normalizedListenHost)]);
+  const isLocal = knownLocal.has(host) || /^127\./.test(host);
+  if (!isLocal) return rule;
+  const targets = new Set(targetPortsFor(rule));
+  const listenOverlap = listenPortsFor(rule).filter((port) => targets.has(port));
+  const reservedOverlap = [...new Set(reservedPorts.map(Number).filter((port) => targets.has(port)))];
+  const errors = [];
+  if (listenOverlap.length) errors.push(`目标指向本机监听端口 ${listenOverlap.join('、')}，会形成转发回环`);
+  if (reservedOverlap.length) errors.push(`目标指向应用管理端口 ${reservedOverlap.join('、')}，为避免暴露管理接口已阻止`);
+  if (errors.length) {
+    const error = new Error(errors.join('；'));
+    error.status = 400;
+    error.details = errors;
+    throw error;
+  }
+  return rule;
+}
+
+function validateFallbackTargetSafety(targetUrl, rules, { localHosts = [], reservedPorts = [] } = {}, errors = []) {
+  let parsed;
+  try { parsed = new URL(targetUrl); } catch { return errors; }
+  const host = normalizedListenHost(parsed.hostname);
+  const knownLocal = new Set(['0.0.0.0', '::', 'localhost', 'ip6-localhost', '127.0.0.1', '::1', ...localHosts.map(normalizedListenHost)]);
+  if (!knownLocal.has(host) && !/^127\./.test(host)) return errors;
+  const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+  if (reservedPorts.map(Number).includes(port)) errors.push(`默认目标指向应用管理端口 ${port}，为避免暴露管理接口已阻止`);
+  const listener = rules.find((rule) => rule.enabled && sourceGroups(rule.protocols).some((protocol) => protocol === 'http' || protocol === 'https') && listenPortsFor(rule).includes(port));
+  if (listener) errors.push(`默认目标指向本机规则“${listener.name}”的监听端口 ${port}，会形成兜底转发回环`);
+  return errors;
+}
+
 function demoRules() {
   return [
     normalizeRule({ name: '家庭面板', protocol: 'http', listenPort: 8080, domains: ['home.lan'], targetProtocol: 'http', targetHost: '192.168.50.121', targetPort: 80, preserveHost: true }),
@@ -320,12 +412,14 @@ function demoRules() {
 }
 
 export class ConfigStore {
-  constructor(dataDir, { demoMode = false, systemCertificates = null } = {}) {
+  constructor(dataDir, { demoMode = false, systemCertificates = null, localHosts = [], reservedPorts = [] } = {}) {
     this.dataDir = dataDir;
     this.file = path.join(dataDir, 'config.json');
     this.certDir = path.join(dataDir, 'certificates');
     this.demoMode = demoMode;
     this.systemCertificates = systemCertificates;
+    this.localHosts = localHosts;
+    this.reservedPorts = reservedPorts;
     this.data = null;
   }
 
@@ -336,14 +430,16 @@ export class ConfigStore {
     } else {
       this.data = {
         version: 1,
-        settings: { healthCheckInterval: 30, logLevel: 'info', startOnBoot: true },
+        settings: defaultSettings(),
         rules: this.demoMode ? demoRules() : [],
         certificates: [],
       };
       this.save();
     }
-    this.data.settings ||= { healthCheckInterval: 30, logLevel: 'info', startOnBoot: true };
+    this.data.settings = { ...defaultSettings(), ...(this.data.settings || {}), unmatchedHost: normalizeUnmatchedHost(this.data.settings?.unmatchedHost) };
     this.data.certificates ||= [];
+    this.data.integrations ||= {};
+    const migratedAutomation = migrateDomainAutomation(this.data.integrations);
     let repairedDuplicateIds = false;
     const usedIds = new Set();
     this.data.rules = (this.data.rules || []).map((source) => {
@@ -355,7 +451,7 @@ export class ConfigStore {
       usedIds.add(rule.id);
       return rule;
     });
-    if (repairedDuplicateIds) this.save();
+    if (repairedDuplicateIds || migratedAutomation) this.save();
     return this.data;
   }
 
@@ -374,6 +470,7 @@ export class ConfigStore {
     let id = randomUUID();
     while (usedIds.has(id)) id = randomUUID();
     const rule = validateRule(normalizeRule({ ...input, id }), this.data.rules, { certificateIds: this.certificateIds() });
+    validateTargetSafety(rule, { localHosts: this.localHosts, reservedPorts: this.reservedPorts });
     this.data.rules.unshift(rule);
     this.save();
     return rule;
@@ -387,6 +484,7 @@ export class ConfigStore {
     if (input.targetPorts === undefined && input.targetPortSpec === undefined && ['targetPort', 'targetPortStart', 'targetPortEnd'].some((key) => Object.hasOwn(input, key))) delete merged.targetPorts;
     const rule = normalizeRule(merged, this.data.rules[index]);
     validateRule(rule, this.data.rules, { certificateIds: this.certificateIds(), allowMissingCertificate: !rule.enabled });
+    validateTargetSafety(rule, { localHosts: this.localHosts, reservedPorts: this.reservedPorts });
     this.data.rules[index] = rule;
     this.save();
     return rule;
@@ -398,6 +496,28 @@ export class ConfigStore {
     const [removed] = this.data.rules.splice(index, 1);
     this.save();
     return removed;
+  }
+
+  batchRules(ids, action) {
+    const selected = new Set(list(ids));
+    if (!selected.size) inputError('请至少选择一条规则');
+    if (!['enable', 'disable', 'delete'].includes(action)) inputError('批量操作不受支持');
+    const found = this.data.rules.filter((rule) => selected.has(rule.id));
+    if (found.length !== selected.size) inputError('部分规则不存在，请刷新后重试');
+    if (action === 'delete') {
+      this.data.rules = this.data.rules.filter((rule) => !selected.has(rule.id));
+      this.save();
+      return { action, affected: found };
+    }
+    const enabled = action === 'enable';
+    const staged = this.data.rules.map((rule) => selected.has(rule.id) ? normalizeRule({ ...rule, enabled }, rule) : rule);
+    for (const rule of staged.filter((candidate) => selected.has(candidate.id))) {
+      validateRule(rule, staged, { certificateIds: this.certificateIds(), allowMissingCertificate: !enabled });
+      validateTargetSafety(rule, { localHosts: this.localHosts, reservedPorts: this.reservedPorts });
+    }
+    this.data.rules = staged;
+    this.save();
+    return { action, affected: staged.filter((rule) => selected.has(rule.id)) };
   }
 
   duplicateRule(id) {
@@ -416,13 +536,22 @@ export class ConfigStore {
     return this.createRule({ ...source, id: undefined, name: `${source.name} 副本`, listenPorts: candidate(), enabled: false });
   }
 
-  settings() { return { ...this.data.settings }; }
+  settings() { return { ...this.data.settings, unmatchedHost: { ...this.data.settings.unmatchedHost } }; }
   updateSettings(input) {
+    const unmatchedHost = normalizeUnmatchedHost(input.unmatchedHost || {}, this.data.settings.unmatchedHost);
+    const settingErrors = [];
+    if (unmatchedHost.action === 'redirect') validateHttpUrl(unmatchedHost.redirectUrl, '重定向地址', settingErrors);
+    if (unmatchedHost.action === 'proxy') {
+      validateHttpUrl(unmatchedHost.targetUrl, '默认目标地址', settingErrors);
+      if (!settingErrors.length) validateFallbackTargetSafety(unmatchedHost.targetUrl, this.data.rules, { localHosts: this.localHosts, reservedPorts: this.reservedPorts }, settingErrors);
+    }
+    if (settingErrors.length) inputError(settingErrors.join('；'));
     this.data.settings = {
       ...this.data.settings,
       healthCheckInterval: integer(input.healthCheckInterval, this.data.settings.healthCheckInterval || 30, 5, 3600),
       logLevel: ['debug', 'info', 'warn', 'error'].includes(input.logLevel) ? input.logLevel : this.data.settings.logLevel || 'info',
       startOnBoot: bool(input.startOnBoot, this.data.settings.startOnBoot),
+      unmatchedHost,
     };
     this.save();
     return this.settings();
@@ -464,6 +593,23 @@ export class ConfigStore {
     this.save();
     return manual;
   }
+  matchingManualCertificate(candidate) {
+    const names = (candidate.subjectAltNames || []).map((name) => String(name).toLowerCase()).sort();
+    if (!names.length) return null;
+    return this.data.certificates.find((certificate) => {
+      const existing = (certificate.subjectAltNames || []).map((name) => String(name).toLowerCase()).sort();
+      return existing.length === names.length && existing.every((name, index) => name === names[index]);
+    }) || null;
+  }
+  replaceManualCertificate(id, certificate) {
+    const index = this.data.certificates.findIndex((candidate) => candidate.id === id);
+    if (index < 0) { const error = new Error('证书不存在'); error.status = 404; throw error; }
+    const existing = this.data.certificates[index];
+    const replacement = { ...certificate, id, source: 'manual', managed: false, createdAt: existing.createdAt || certificate.createdAt, updatedAt: now() };
+    this.data.certificates[index] = replacement;
+    this.save();
+    return replacement;
+  }
   removeCertificate(id) {
     const index = this.data.certificates.findIndex((certificate) => certificate.id === id);
     if (index < 0) {
@@ -474,6 +620,110 @@ export class ConfigStore {
     const [certificate] = this.data.certificates.splice(index, 1);
     this.save();
     return certificate;
+  }
+
+  certificatePushStatus() {
+    const config = this.data.integrations?.certificatePush;
+    return config ? { enabled: true, bindingId: config.bindingId, createdAt: config.createdAt, lastUsedAt: config.lastUsedAt || null } : { enabled: false, bindingId: null, createdAt: null, lastUsedAt: null };
+  }
+  rotateCertificatePush() {
+    const token = randomBytes(32).toString('base64url');
+    this.data.integrations.certificatePush = { bindingId: randomUUID(), tokenHash: sha256(token), createdAt: now(), lastUsedAt: null };
+    this.save();
+    return { ...this.certificatePushStatus(), token };
+  }
+  disableCertificatePush() {
+    delete this.data.integrations.certificatePush;
+    this.save();
+    return this.certificatePushStatus();
+  }
+  verifyCertificatePush(bindingId, token) {
+    const config = this.data.integrations?.certificatePush;
+    if (!config || config.bindingId !== text(bindingId) || !token) return false;
+    const expected = Buffer.from(config.tokenHash, 'hex');
+    const actual = Buffer.from(sha256(token), 'hex');
+    return expected.length === actual.length && timingSafeEqual(expected, actual);
+  }
+  markCertificatePushUsed() {
+    if (!this.data.integrations?.certificatePush) return;
+    this.data.integrations.certificatePush.lastUsedAt = now();
+    this.save();
+  }
+  webhookConfig() {
+    const config = this.data.integrations?.webhook || {};
+    return {
+      enabled: Boolean(config.enabled),
+      url: text(config.url),
+      events: Array.isArray(config.events) ? config.events.filter((event) => WEBHOOK_EVENTS.has(event)) : [...WEBHOOK_EVENTS],
+      headers: { ...(config.headers || {}) },
+      lastDeliveryAt: config.lastDeliveryAt || null,
+      lastError: config.lastError || null,
+    };
+  }
+  webhookStatus() {
+    const config = this.webhookConfig();
+    const { headers, ...publicConfig } = config;
+    return { ...publicConfig, headerNames: Object.keys(headers) };
+  }
+  updateWebhook(input = {}) {
+    const existing = this.webhookConfig();
+    const headers = input.clearHeaders ? {} : input.headers !== undefined ? parseHeaders(input.headers) : existing.headers;
+    const events = input.events === undefined ? existing.events : list(input.events).filter((event) => WEBHOOK_EVENTS.has(event));
+    const config = {
+      ...existing,
+      enabled: bool(input.enabled, existing.enabled),
+      url: input.url === undefined ? existing.url : text(input.url),
+      events,
+      headers,
+    };
+    const errors = [];
+    if (config.url) validateHttpUrl(config.url, 'Webhook 地址', errors);
+    if (config.enabled && !config.url) errors.push('启用 Webhook 前请填写地址');
+    if (config.enabled && !config.events.length) errors.push('启用 Webhook 前请至少选择一种事件');
+    validateHeaders({ customHeaders: config.headers, realIp: { enabled: false } }, errors);
+    if (errors.length) inputError(errors.join('；'));
+    this.data.integrations.webhook = config;
+    this.save();
+    return this.webhookStatus();
+  }
+  recordWebhookDelivery({ ok, error = null }) {
+    if (!this.data.integrations?.webhook) return;
+    this.data.integrations.webhook.lastDeliveryAt = now();
+    this.data.integrations.webhook.lastError = ok ? null : text(error, '发送失败');
+    this.save();
+  }
+
+  ddnsConfig() { return normalizeDdns(this.data.integrations?.ddns); }
+  ddnsStatus() { return publicDdns(this.ddnsConfig()); }
+  updateDdns(input = {}) {
+    this.data.integrations.ddns = updateDdnsConfig(this.ddnsConfig(), input);
+    this.save();
+    return this.ddnsStatus();
+  }
+  recordDdnsResult({ ok, ip = null, changed = null, error = null }) {
+    const config = this.ddnsConfig();
+    config.lastRunAt = now();
+    config.lastError = ok ? null : text(error, 'DDNS 同步失败');
+    if (ok) { config.lastSuccessAt = config.lastRunAt; config.lastIp = ip || config.lastIp; config.lastChanged = changed; }
+    this.data.integrations.ddns = config;
+    this.save();
+  }
+  issuanceConfig() {
+    const defaults = defaultIssuance();
+    const saved = this.data.integrations?.certificateIssuance || {};
+    return { ...defaults, ...saved, acme: { ...defaults.acme, ...saved.acme }, aliyun: { ...defaults.aliyun, ...(saved.aliyun ? { apiVersion: 'v1' } : {}), ...saved.aliyun } };
+  }
+  issuanceStatus() { return publicIssuance(this.issuanceConfig()); }
+  updateIssuance(input = {}) {
+    this.data.integrations.certificateIssuance = updateIssuanceConfig(this.issuanceConfig(), input);
+    this.save();
+    return this.issuanceStatus();
+  }
+  patchIssuance(provider, patch) {
+    const config = this.issuanceConfig();
+    config[provider] = { ...config[provider], ...patch };
+    this.data.integrations.certificateIssuance = config;
+    this.save();
   }
 
   exportConfig() {

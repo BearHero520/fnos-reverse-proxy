@@ -1,3 +1,4 @@
+import { normalizeFpk } from './normalize-fpk.mjs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -12,7 +13,7 @@ const webBuild = path.join(root, 'build', 'web');
 const releaseDir = path.join(root, 'dist');
 const localFnpack = path.join(root, '.tools', 'fnpack', process.platform === 'win32' ? 'fnpack.exe' : 'fnpack');
 const fnpackCommand = process.env.FNPACK_PATH || (fs.existsSync(localFnpack) ? localFnpack : 'fnpack');
-const releaseVersion = '1.0.4';
+const releaseVersion = '1.0.16';
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -49,7 +50,7 @@ function validatePackageContract() {
   const uiConfigPath = path.join(packDir, 'app', 'ui', 'config');
   const privilegePath = path.join(packDir, 'config', 'privilege');
   const resourcePath = path.join(packDir, 'config', 'resource');
-  const launcherPath = path.join(packDir, 'cmd', 'main');
+  const launcherPath = path.join(packDir, 'cmd', 'service');
   const manifest = readManifest(manifestPath);
   const uiConfig = readJson(uiConfigPath);
   const privilege = readJson(privilegePath);
@@ -152,7 +153,7 @@ function validatePackageContract() {
     || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.sock$/.test(entry.gatewaySocket)) {
     throw new Error(`gatewaySocket 必须是安全的 .sock 文件名，当前值：${entry.gatewaySocket || '(空)'}`);
   }
-  const expectedSocket = `\${TRIM_APPDEST}/${entry.gatewaySocket}`;
+  const expectedSocket = `\${TRIM_PKGVAR}/${entry.gatewaySocket}`;
   if (launcherSocket !== expectedSocket) {
     throw new Error(`启动脚本 SOCKET_PATH 与 gatewaySocket 不一致：${launcherSocket}`);
   }
@@ -160,16 +161,12 @@ function validatePackageContract() {
   if (launcherFrontend !== expectedFrontend) {
     throw new Error(`启动脚本 FRONTEND_DIST 必须指向包内 app/${path.basename(webDir)}，当前值：${launcherFrontend}`);
   }
-  if (privilege.username !== appName || privilege.groupname !== appName) {
-    throw new Error(`权限用户和组必须与 appname 一致：${appName}`);
+  if (privilege.defaults?.['run-as'] !== 'root' || privilege.username || privilege.groupname || privilege.capabilities) {
+    throw new Error('集成部署组件要求 root 生命周期，Web 服务必须由 cmd/main 降权启动');
   }
-  if (privilege.defaults?.['run-as'] !== 'package') {
-    throw new Error('权限配置必须使用专用应用用户（defaults.run-as=package）');
-  }
-  if (!Array.isArray(privilege.capabilities)
-    || privilege.capabilities.length !== 1
-    || privilege.capabilities[0] !== 'CAP_NET_BIND_SERVICE') {
-    throw new Error('权限配置只能申明 CAP_NET_BIND_SERVICE 能力');
+  const supervisor = fs.readFileSync(path.join(packDir, 'cmd', 'main'), 'utf8');
+  if (!supervisor.includes('--reuid reverse-proxy --regid reverse-proxy --init-groups') || !supervisor.includes('setpriv')) {
+    throw new Error('主服务缺少强制降权启动');
   }
   if (entry.allUsers !== false || entry.control?.accessPerm !== 'readonly') {
     throw new Error('管理入口必须使用 allUsers=false 且 control.accessPerm=readonly');
@@ -251,6 +248,7 @@ if (process.argv.includes('--validate-only')) {
   console.log('FPK 身份、桌面入口与统一网关配置校验通过。');
   process.exit(0);
 }
+run(process.execPath, [path.join(root, 'scripts', 'prepare-deployment-runtime.mjs')]);
 run('npm', ['--prefix', 'backend', 'test']);
 run('npm', ['run', 'build']);
 resetDirectory(serverDir);
@@ -258,9 +256,11 @@ resetDirectory(webDir);
 fs.cpSync(webBuild, webDir, { recursive: true });
 for (const name of fs.readdirSync(path.join(packDir, 'cmd'))) fs.chmodSync(path.join(packDir, 'cmd', name), 0o755);
 
-for (const entry of ['server.js', 'package.json', 'package-lock.json', 'lib']) {
+for (const entry of ['server.js', 'fnos-deployer-helper.js', 'package.json', 'package-lock.json', 'lib']) {
   fs.cpSync(path.join(root, 'backend', entry), path.join(serverDir, entry), { recursive: true });
 }
+const privilegedFiles = ['server/fnos-deployer-helper.js', 'server/lib/fnos-deployment-engine.js', 'server/package.json', 'deployment-runtime/x64/node', 'deployment-runtime/arm64/node'];
+fs.writeFileSync(path.join(packDir, 'config', 'deployment.sha256'), privilegedFiles.map((file) => `${createHash('sha256').update(fs.readFileSync(path.join(packDir, 'app', file))).digest('hex')}  ${file}\n`).join(''));
 for (const required of [
   path.join(webDir, 'index.html'),
   path.join(serverDir, 'server.js'),
@@ -271,7 +271,7 @@ for (const required of [
   ]) {
   if (!fs.existsSync(required)) throw new Error(`打包文件缺失：${path.relative(root, required)}`);
 }
-const launcher = fs.readFileSync(path.join(packDir, 'cmd', 'main'), 'utf8');
+const launcher = fs.readFileSync(path.join(packDir, 'cmd', 'service'), 'utf8');
 if (!launcher.includes('FRONTEND_DIST="${TRIM_APPDEST}/www"')) throw new Error('启动脚本未将 FRONTEND_DIST 指向包内 app/www');
 run('npm', ['ci', '--omit=dev'], serverDir);
 
@@ -391,6 +391,8 @@ function verifyGeneratedFpk(generatedFpk, stagingDir) {
     'ICON.PNG',
     'ICON_256.PNG',
     'cmd/main',
+    'cmd/service',
+    'cmd/deployment',
     'cmd/install_init',
     'cmd/install_callback',
     'cmd/upgrade_init',
@@ -461,12 +463,22 @@ function verifyGeneratedFpk(generatedFpk, stagingDir) {
   }
   for (const entry of [
     'server/server.js',
+    'server/fnos-deployer-helper.js',
+    'server/lib/fnos-deployment-engine.js',
     'server/package.json',
     'server/package-lock.json',
     'server/lib/certificate-parser.js',
     'server/lib/config-store.js',
     'server/lib/proxy-manager.js',
     'server/lib/system-certificate-store.js',
+    'server/lib/automation-config.js',
+    'server/lib/aliyun-client.js',
+    'server/lib/aliyun-v2.js',
+    'server/lib/cloudflare-dns.js',
+    'server/lib/ddns-service.js',
+    'server/lib/ddns-providers.js',
+    'server/lib/certificate-issuance.js',
+    'server/lib/certificate-rotation.js',
     'ui/config',
     'ui/images/icon_64.png',
     'ui/images/icon_256.png',
@@ -487,6 +499,7 @@ try {
   if (!fs.existsSync(generatedFpk) || !fs.statSync(generatedFpk).isFile() || fs.statSync(generatedFpk).size === 0) {
     throw new Error(`fnpack 未在隔离目录生成预期产物：${generatedFpk}`);
   }
+  normalizeFpk(generatedFpk);
   verifyGeneratedFpk(generatedFpk, stagingDir);
 
   archiveFpk(path.join(root, expectedFpkName), appName, 'project-root');
@@ -510,6 +523,9 @@ try {
     throw new Error(`FPK 产物发布失败：${releaseFpk}`);
   }
   console.log(`FPK 输出：${releaseFpk}`);
+  const checksum = createHash('sha256').update(fs.readFileSync(releaseFpk)).digest('hex');
+  fs.writeFileSync(`${releaseFpk}.sha256`, `${checksum}  ${path.basename(releaseFpk)}\n`);
+  // Deployment runtime is included in the main FPK; no second app is required.
 } finally {
   try {
     assertInside(stagingDir, releaseDir);

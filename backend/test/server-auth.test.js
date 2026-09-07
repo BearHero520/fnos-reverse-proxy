@@ -64,7 +64,7 @@ async function freeTcpPort() {
   return port;
 }
 
-async function startServer({ socketPath = '', port = '' }) {
+async function startServer({ socketPath = '', port = '', demoMode = false }) {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reverse-proxy-auth-'));
   const child = spawn(process.execPath, [serverFile], {
     cwd: backendDir,
@@ -77,6 +77,7 @@ async function startServer({ socketPath = '', port = '' }) {
       GATEWAY_PREFIX: gatewayPrefix,
       PORT: String(port),
       SOCKET_PATH: socketPath,
+      DEMO_MODE: demoMode ? '1' : '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -158,6 +159,28 @@ test('UDS 统一网关模式要求已登录的 fnOS 管理员头', { timeout: 20
   assert.equal(JSON.parse(admin.body).ok, true);
   assert.equal(admin.headers['cache-control'], 'no-store');
 
+  for (const route of ['ddns', 'certificate-issuance', 'fnos-deployment']) {
+    const anonymous = await request({ socketPath, pathname: `${gatewayPrefix}/api/integrations/${route}` });
+    assert.equal(anonymous.status, 401);
+    const allowed = await request({ socketPath, pathname: `${gatewayPrefix}/api/integrations/${route}`, headers: { 'X-Trim-Userid': '1000', 'X-Trim-Isadmin': 'true' } });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers['cache-control'], 'no-store');
+  }
+  for (const action of ['test', 'sync', 'detect']) {
+    const denied = await request({ socketPath, pathname: `${gatewayPrefix}/api/integrations/ddns/${action}`, method: 'POST' });
+    assert.equal(denied.status, 401);
+  }
+  for (const scope of ['ddns', 'certificate-issuance']) {
+    const pathname = `${gatewayPrefix}/api/integrations/${scope}/aliyun/resolve-zone`;
+    assert.equal((await request({ socketPath, pathname, method: 'POST' })).status, 401);
+    assert.equal((await request({ socketPath, pathname, method: 'POST', headers: { 'X-Trim-Userid': '1000', 'X-Trim-Isadmin': 'false' } })).status, 403);
+  }
+  for (const action of ['refresh', 'prepare', 'deploy']) {
+    assert.equal((await request({ socketPath, pathname: `${gatewayPrefix}/api/integrations/fnos-deployment/${action}`, method: 'POST' })).status, 401);
+    assert.equal((await request({ socketPath, pathname: `${gatewayPrefix}/api/integrations/fnos-deployment/${action}`, method: 'POST', headers: { 'X-Trim-Userid': '1000', 'X-Trim-Isadmin': 'false' } })).status, 403);
+  }
+  assert.equal((await request({ socketPath, pathname: `${gatewayPrefix}/api/integrations/fnos-deployment`, method: 'PUT' })).status, 401);
+
   const bareApi = await request({
     socketPath,
     pathname: '/api/status',
@@ -184,4 +207,62 @@ test('本地 TCP 模式仅绑定回环地址且保留无头 API 调试访问', {
     headers: { 'X-Trim-Userid': 'forged', 'X-Trim-Isadmin': 'false' },
   });
   assert.equal(prefixedApi.status, 200);
+});
+
+test('separate integration APIs persist independently and demo issuance never claims a real certificate', { timeout: 20_000 }, async (t) => {
+  const port = await freeTcpPort();
+  const instance = await startServer({ port, demoMode: true });
+  t.after(() => stopServer(instance));
+  await waitForServer({ port }, 200);
+  const send = async (route, method = 'GET', body = {}) => request({ port, pathname: `${gatewayPrefix}/api/integrations/${route}`, method, headers: { 'Content-Type': 'application/json' }, body: method === 'GET' ? '' : JSON.stringify(body) });
+  const missing = await send('certificate-issuance/issue', 'POST');
+  assert.equal(missing.status, 400);
+  const configured = await send('certificate-issuance', 'PUT', { provider: 'aliyun-free', aliyun: { accessKeyId: 'test-only-id', accessKeySecret: 'test-only-secret', domain: 'home.example.com', dnsZone: 'example.com' } });
+  assert.equal(configured.status, 200);
+  assert.equal(configured.body.includes('test-only-secret'), false);
+  const ddns = await send('ddns', 'PUT', { recordName: 'other.example.com' });
+  assert.equal(ddns.status, 200);
+  const issuance = JSON.parse((await send('certificate-issuance')).body).integration;
+  assert.equal(issuance.aliyun.domain, 'home.example.com');
+  const accepted = await send('certificate-issuance/issue', 'POST');
+  assert.equal(accepted.status, 202);
+  assert.equal(JSON.parse(accepted.body).result.demoMode, true);
+  assert.equal(JSON.parse(accepted.body).integration.aliyun.lastSuccessAt, null);
+  assert.equal(JSON.parse(accepted.body).integration.aliyun.certificateId, null);
+  assert.equal((await send('domain-automation')).status, 404);
+  for (const [provider, config] of [
+    ['aliyun', { accessKeyId: 'ddns-only-id', accessKeySecret: 'ddns-only-secret', dnsZone: 'example.com' }],
+    ['dnspod', { secretId: 'dnspod-only-id', secretKey: 'dnspod-only-secret', dnsZone: 'example.com' }],
+  ]) {
+    const saved = await send('ddns', 'PUT', { provider, [provider]: config, enabled: true });
+    assert.equal(saved.status, 200);
+    assert.equal(JSON.parse(saved.body).integration.provider, provider);
+    assert.equal(saved.body.includes('ddns-only-secret'), false);
+    assert.equal(saved.body.includes('dnspod-only-secret'), false);
+    for (const action of ['test', 'sync']) {
+      const checked = await send(`ddns/${action}`, 'POST');
+      assert.equal(checked.status, 200);
+      assert.equal(JSON.parse(checked.body).result.demoMode, true);
+      assert.equal(JSON.parse(checked.body).integration.lastSuccessAt, null);
+    }
+  }
+  assert.equal(JSON.parse((await send('certificate-issuance')).body).integration.aliyun.accessKeyId, 'test-only-id');
+  for (const scope of ['ddns', 'certificate-issuance']) {
+    const beforeLookup = (await send(scope)).body;
+    const lookup = await send(`${scope}/aliyun/resolve-zone`, 'POST', { domain: 'home.example.com', accessKeyId: 'unsaved-draft-id', accessKeySecret: 'unsaved-draft-secret' });
+    assert.equal(lookup.status, 200); assert.equal(lookup.headers['cache-control'], 'no-store');
+    assert.equal(JSON.parse(lookup.body).result.demoMode, true); assert.equal(JSON.parse(lookup.body).result.dnsZone, null);
+    assert.equal(lookup.body.includes('unsaved-draft-secret'), false);
+    assert.equal((await send(scope)).body, beforeLookup, '识别不得隐式保存草稿、密钥或修改运行状态');
+    assert.equal((await send(`${scope}/aliyun/resolve-zone`, 'POST', { domain: 'bad' })).status, 400);
+    assert.equal((await send(`${scope}/aliyun/resolve-zone`, 'POST', { domain: 'home.example.com', accessKeyId: 'new-id' })).status, 400);
+  }
+  assert.equal((await send('ddns', 'PUT', { provider: 'unrecognized' })).status, 400);
+  const detected = await send('ddns/detect', 'POST', { recordType: 'A' });
+  assert.equal(detected.status, 200); assert.equal(JSON.parse(detected.body).result.demoMode, true); assert.equal(JSON.parse(detected.body).result.ip, undefined);
+  assert.equal((await send('ddns/detect', 'POST', { recordType: 'invalid' })).status, 400);
+  const deployment = await send('fnos-deployment/refresh', 'POST');
+  assert.equal(JSON.parse(deployment.body).integration.helper.available, false);
+  assert.equal((await send('fnos-deployment/prepare', 'POST')).status, 400);
+  assert.equal((await send('fnos-deployment/deploy', 'POST', { confirmed: true, token: 'forged' })).status, 409);
 });

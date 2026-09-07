@@ -408,6 +408,19 @@ test('retries when the inventory changes after it was read instead of accepting 
   }
 });
 
+test('accepts repeated copies of the same certificate in a fnOS fullchain', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fnos-system-cert-duplicate-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const fixture = certificateFixture();
+  const material = writeMaterial(directory, 'system', { ...fixture, certPem: fixture.certPem + fixture.certPem });
+  const configPath = writeInventory(directory, [{ fullchain: material.certificate, privateKey: material.privateKey }]);
+  const source = new SystemCertificateStore({ configPath, logger });
+  const result = await source.reload();
+  assert.equal(result.status.state, 'ready');
+  assert.equal(result.certificates[0].chainLength, 1);
+  assert.equal(result.status.usingLastKnownGood, false);
+});
+
 test('rejects unrelated certificates in a configured full chain', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'fnos-system-cert-chain-'));
   try {

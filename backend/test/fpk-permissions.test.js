@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { normalizeFpk } from '../../scripts/normalize-fpk.mjs';
+
+test('FPK normalization preserves code, sets executable/runtime permissions and updates nested checksum', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fpk-permissions-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const sub of ['app/server', 'app/deployment-runtime/x64', 'cmd']) fs.mkdirSync(path.join(dir, sub), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'app/server/server.js'), 'exact-code\n');
+  fs.writeFileSync(path.join(dir, 'app/deployment-runtime/x64/node'), 'ELF-fixture');
+  fs.writeFileSync(path.join(dir, 'cmd/main'), '#!/bin/bash\nexit 0\n');
+  fs.writeFileSync(path.join(dir, 'manifest'), 'version = 1.0.10\nchecksum = old\n');
+  const tar = (args) => execFileSync('tar', args, { cwd: dir });
+  tar(['-czf', 'app.tgz', '-C', 'app', 'server', 'deployment-runtime']);
+  tar(['-czf', 'test.fpk', 'manifest', 'cmd', 'app.tgz']);
+  normalizeFpk(path.join(dir, 'test.fpk'));
+  const nested = tar(['-xOf', 'test.fpk', 'app.tgz']);
+  fs.writeFileSync(path.join(dir, 'normalized.tgz'), nested);
+  const manifest = tar(['-xOf', 'test.fpk', 'manifest']).toString();
+  assert.ok(manifest.includes(createHash('md5').update(nested).digest('hex')));
+  assert.equal(tar(['-xOf', 'normalized.tgz', 'server/server.js']).toString(), 'exact-code\n');
+  assert.match(tar(['-tvf', 'normalized.tgz']).toString(), /-rwxr-xr-x[^\n]*deployment-runtime\/x64\/node/);
+  assert.match(tar(['-tvf', 'normalized.tgz']).toString(), /-rw-r--r--[^\n]*server\/server.js/);
+  assert.match(tar(['-tvf', 'test.fpk']).toString(), /-rwxr-xr-x[^\n]*cmd\/main/);
+});

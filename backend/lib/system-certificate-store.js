@@ -361,7 +361,12 @@ export class SystemCertificateStore extends EventEmitter {
     ]);
     const key = privateKeyFromBuffer(privateKeyBuffer);
     const blocks = certificateBlocks(certificateBuffer);
-    const parsed = blocks.map((pem) => ({ pem, x509: new X509Certificate(pem) }));
+    // fnOS exports can repeat the leaf/root in a concatenated fullchain.
+    // Remove exact DER duplicates only; unrelated certificates still fail validation.
+    const parsed = [...new Map(blocks.map((pem) => {
+      const x509 = new X509Certificate(pem);
+      return [x509.raw.toString('base64'), { pem, x509 }];
+    })).values()];
     const leafIndex = parsed.findIndex(({ x509 }) => x509.checkPrivateKey(key));
     if (leafIndex < 0) {
       const error = new Error('证书与私钥不匹配');

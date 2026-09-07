@@ -12,6 +12,9 @@ export default defineConfig({
   },
   server: {
     port: 5178,
+    watch: {
+      ignored: ['**/dist/**', '**/App.Native.ReverseProxy/app/server/**', '**/build/**'],
+    },
     warmup: {
       clientFiles: ["./src/main.jsx"],
     },
